@@ -50,7 +50,7 @@ pip install prophet
 |------|------|------|
 | `time` | datetime | 时间戳 |
 | `value` | float | 数值 |
-| `day_type` | int | 0=工作日, 1=假期, 其他=异常 |
+| `day_type` | int | 1=工作日, 0=休息日, 其他=异常 |
 
 ### 3. 使用示例
 
@@ -73,11 +73,11 @@ from time_series_forecast import predict_at_midnight
 # 加载数据
 df = pd.read_csv('your_data.csv')
 
-# 预测 - 输入0表示工作日
-result = predict_at_midnight(df, interval_minutes=15, calendar_day_type_input=0)
-
-# 预测 - 输入1表示假期
+# 预测 - 输入1表示工作日
 result = predict_at_midnight(df, interval_minutes=15, calendar_day_type_input=1)
+
+# 预测 - 输入0表示休息日
+result = predict_at_midnight(df, interval_minutes=15, calendar_day_type_input=0)
 
 print(result)
 ```
@@ -97,7 +97,7 @@ nine_am_data = df_today[df_today['time'].dt.hour < 9]
 # 预测 - 自动推断日期类型
 day_type, forecast = predict_at_nine(df, nine_am_data, interval_minutes=15)
 
-print(f"推断的日期类型: {day_type} (0=工作日, 1=假期, 2=异常)")
+print(f"推断的日期类型: {day_type} (1=工作日, 0=休息日, 2=异常)")
 print(forecast)
 ```
 
@@ -118,7 +118,7 @@ print(f"评估结果: {day_type}")  # 'weekday', 'holiday', 或 'anomaly'
 |------|------|------|------|
 | `time` | datetime | 是 | 时间戳 |
 | `value` | float | 是 | 数值 |
-| `day_type` | int | 是 | 0=工作日, 1=假期, 其他=异常 |
+| `day_type` | int | 是 | 1=工作日, 0=休息日, 其他=异常 |
 
 ## 输出数据格式
 
@@ -136,7 +136,7 @@ print(f"评估结果: {day_type}")  # 'weekday', 'holiday', 或 'anomaly'
 
 返回元组: `(day_type, forecast_df)`
 
-- `day_type`: 推断的日期类型 (0=工作日, 1=假期, 2=异常)
+- `day_type`: 推断的日期类型 (1=工作日, 0=休息日, 2=异常)
 - `forecast_df`: DataFrame，列同上
 
 ## 高级参数
@@ -144,18 +144,18 @@ print(f"评估结果: {day_type}")  # 'weekday', 'holiday', 或 'anomaly'
 ### 时间间隔
 ```python
 # 15分钟间隔
-result = predict_at_midnight(df, interval_minutes=15, calendar_day_type_input=0)
+result = predict_at_midnight(df, interval_minutes=15, calendar_day_type_input=1)
 
 # 60分钟间隔
-result = predict_at_midnight(df, interval_minutes=60, calendar_day_type_input=0)
+result = predict_at_midnight(df, interval_minutes=60, calendar_day_type_input=1)
 ```
 
 ### 日期类型说明
 
 | calendar_day_type_input | 含义 |
 |------------------------|------|
-| 0 | 工作日 (weekday) |
-| 1 | 节假日 (holiday) |
+| 1 | 工作日 (weekday) |
+| 0 | 休息日 (holiday) |
 | 其他数字 | 异常日期 (anomaly) |
 
 ## 运行测试

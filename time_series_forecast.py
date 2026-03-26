@@ -1,19 +1,19 @@
 """
 时序数据预测脚本 - 支持2年以上历史数据
 输入：包含 time, value, day_type 三列的 DataFrame（支持15分钟或60分钟间隔）
-      day_type: 0=工作日, 1=假期, 其他=异常
+      day_type: 1=工作日, 0=休息日, 其他=异常
 输出：当天剩余时间的value预测
 
 预测逻辑：
 1. 0点预测：根据用户输入的预设日期类型进行预测
 2. 9点预测：根据0-9时数据自动推断日期类型，覆盖预设类型
-3. 模型训练时使用day_type作为特征
+3. 使用动态模板匹配进行预测
 
 性能优化：
-- 支持大数据量（2年+），自动采样最近90天数据用于模型训练
+- 支持大数据量（2年+），自动采样最近90天数据用于分析
 - 支持多种时间间隔（15分钟/60分钟），自动调整样本数量
-- Prophet模型参数优化，限制训练时间
 - 高效的日期类型判断算法
+- 使用动态生成的模板，准确匹配数据特征
 
 环境要求：无GPU，运行时间控制在30分钟内
 """
@@ -24,103 +24,6 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-# 尝试导入Prophet，如果未安装则使用备选方案
-try:
-    from prophet import Prophet
-    PROPHET_AVAILABLE = True
-except ImportError:
-    PROPHET_AVAILABLE = False
-    print("Prophet未安装，将使用模板预测方案")
-
-
-# 预定义的工作日/假期模式模板（基于历史数据统计）
-# 这些模板代表不同类型日期的平均value曲线
-
-# 15分钟间隔模板（24小时=96个点）
-WEEKDAY_PATTERN_15MIN = np.array([
-    40, 38, 35, 33, 30, 28, 25, 23, 22, 20,  # 00:00-02:15
-    18, 17, 15, 14, 13, 12, 15, 18, 22, 28,  # 02:30-04:45
-    35, 45, 55, 70, 85, 100, 115, 125, 130, 125,  # 05:00-07:15
-    115, 105, 95, 88, 90, 100, 120, 145, 170, 185,  # 07:30-09:45
-    190, 185, 175, 165, 160, 165, 175, 185, 190, 185,  # 10:00-12:15
-    175, 165, 160, 165, 175, 185, 190, 185, 175, 160,  # 12:30-14:45
-    145, 130, 115, 105, 100, 105, 115, 130, 145, 160,  # 15:00-17:15
-    170, 175, 170, 155, 135, 115, 100, 90, 85, 80,  # 17:30-19:45
-    78, 75, 72, 68, 65, 62, 58, 55, 52, 50,  # 20:00-22:15
-    48, 45, 42, 40, 38, 35  # 22:30-23:45
-])
-
-HOLIDAY_PATTERN_15MIN = np.array([
-    25, 22, 20, 18, 15, 12, 10, 10, 10, 10,  # 00:00-02:15
-    10, 10, 10, 10, 10, 10, 10, 12, 15, 20,  # 02:30-04:45
-    25, 30, 35, 40, 45, 50, 55, 60, 65, 70,  # 05:00-07:15
-    75, 78, 80, 82, 83, 85, 85, 85, 85, 85,  # 07:30-09:45
-    85, 85, 85, 85, 85, 85, 85, 85, 85, 85,  # 10:00-12:15
-    85, 85, 85, 85, 85, 85, 85, 85, 85, 85,  # 12:30-14:45
-    85, 85, 85, 85, 85, 85, 85, 85, 85, 85,  # 15:00-17:15
-    85, 85, 85, 85, 85, 83, 80, 75, 70, 65,  # 17:30-19:45
-    60, 55, 50, 45, 40, 35, 30, 28, 25, 22,  # 20:00-22:15
-    20, 18, 16, 14, 12, 10  # 22:30-23:45
-])
-
-# 60分钟间隔模板（24小时=24个点）- 通过重采样15分钟模板得到
-WEEKDAY_PATTERN_60MIN = np.array([
-    35,   # 00:00 (00:00-00:45平均)
-    19,   # 01:00 (01:00-01:45平均)
-    15,   # 02:00 (02:00-02:45平均)
-    16,   # 03:00 (03:00-03:45平均)
-    24,   # 04:00 (04:00-04:45平均)
-    51,   # 05:00 (05:00-05:45平均)
-    113,  # 06:00 (06:00-06:45平均)
-    124,  # 07:00 (07:00-07:45平均)
-    158,  # 08:00 (08:00-08:45平均)
-    183,  # 09:00 (09:00-09:45平均)
-    180,  # 10:00 (10:00-10:45平均)
-    174,  # 11:00 (11:00-11:45平均)
-    177,  # 12:00 (12:00-12:45平均)
-    176,  # 13:00 (13:00-13:45平均)
-    165,  # 14:00 (14:00-14:45平均)
-    148,  # 15:00 (15:00-15:45平均)
-    131,  # 16:00 (16:00-16:45平均)
-    115,  # 17:00 (17:00-17:45平均)
-    106,  # 18:00 (18:00-18:45平均)
-    85,   # 19:00 (19:00-19:45平均)
-    70,   # 20:00 (20:00-20:45平均)
-    58,   # 21:00 (21:00-21:45平均)
-    50,   # 22:00 (22:00-22:45平均)
-    42    # 23:00 (23:00-23:45平均)
-])
-
-HOLIDAY_PATTERN_60MIN = np.array([
-    20,   # 00:00
-    11,   # 01:00
-    10,   # 02:00
-    11,   # 03:00
-    16,   # 04:00
-    31,   # 05:00
-    55,   # 06:00
-    78,   # 07:00
-    84,   # 08:00
-    85,   # 09:00
-    85,   # 10:00
-    85,   # 11:00
-    85,   # 12:00
-    85,   # 13:00
-    85,   # 14:00
-    85,   # 15:00
-    85,   # 16:00
-    85,   # 17:00
-    79,   # 18:00
-    68,   # 19:00
-    54,   # 20:00
-    43,   # 21:00
-    34,   # 22:00
-    24    # 23:00
-])
-
-# 默认模板（向后兼容）
-WEEKDAY_PATTERN = WEEKDAY_PATTERN_15MIN
-HOLIDAY_PATTERN = HOLIDAY_PATTERN_15MIN
 
 
 def get_interval_config(interval_minutes=15):
@@ -142,8 +45,6 @@ def get_interval_config(interval_minutes=15):
             'points_for_detection': 36,       # 9小时 * 4
             'freq': '15min',
             'min_daily_points': 48,           # 至少半天数据
-            'weekday_pattern': WEEKDAY_PATTERN_15MIN,
-            'holiday_pattern': HOLIDAY_PATTERN_15MIN,
             'stats_window_days': 90,          # 统计窗口：90天
             'train_window_days': 30           # 训练窗口：30天
         }
@@ -156,8 +57,6 @@ def get_interval_config(interval_minutes=15):
             'points_for_detection': 9,          # 9小时 * 1
             'freq': '60min',
             'min_daily_points': 12,            # 至少半天数据
-            'weekday_pattern': WEEKDAY_PATTERN_60MIN,
-            'holiday_pattern': HOLIDAY_PATTERN_60MIN,
             'stats_window_days': 180,          # 统计窗口：180天（样本较少，需要更长的窗口）
             'train_window_days': 60            # 训练窗口：60天
         }
@@ -191,6 +90,61 @@ def detect_interval(df):
             return 60
 
 
+def generate_pattern_from_history(df, interval_minutes=15):
+    """
+    根据历史数据动态生成工作日和假期的模式模板
+
+    参数:
+        df: DataFrame，包含 'time', 'value', 'day_type' 列
+        interval_minutes: 时间间隔（15或60）
+
+    返回:
+        dict: {'weekday': array, 'holiday': array}
+            - weekday: 工作日平均模式数组 (96点 for 15min, 24点 for 60min)
+            - holiday: 假期平均模式数组
+    """
+    df = df.copy()
+    df['time'] = pd.to_datetime(df['time'])
+
+    # 提取日期
+    df['date'] = df['time'].dt.date
+
+    # 根据interval计算每天的总点数
+    points_per_day = int(24 * 60 / interval_minutes)
+
+    # 按日期分组，计算每天每个时刻的平均值
+    df['time_of_day'] = df['time'].dt.hour * 60 + df['time'].dt.minute
+
+    # 将time_of_day转换为点序号 (0 到 points_per_day-1)
+    df['point_index'] = (df['time_of_day'] / interval_minutes).astype(int) % points_per_day
+
+    # 分离工作日和假期数据
+    weekday_data = df[df['day_type'] == 1]
+    holiday_data = df[df['day_type'] == 0]
+
+    # 计算每个时间点的平均值
+    weekday_pattern = weekday_data.groupby('point_index')['value'].mean().sort_index()
+    holiday_pattern = holiday_data.groupby('point_index')['value'].mean().sort_index()
+
+    # 填充缺失的时间点（如果有）
+    all_indices = np.arange(points_per_day)
+    weekday_pattern = weekday_pattern.reindex(all_indices)
+    holiday_pattern = holiday_pattern.reindex(all_indices)
+
+    # 填充NaN值（使用整体均值）
+    weekday_pattern = weekday_pattern.fillna(weekday_pattern.mean())
+    holiday_pattern = holiday_pattern.fillna(holiday_pattern.mean())
+
+    weekday_pattern = weekday_pattern.values
+    holiday_pattern = holiday_pattern.values
+
+    print(f"\n从历史数据生成模板（间隔{interval_minutes}分钟，{points_per_day}点/天）:")
+    print(f"  工作日模板: {len(weekday_pattern)}点, 均值={np.mean(weekday_pattern):.2f}")
+    print(f"  假期模板: {len(holiday_pattern)}点, 均值={np.mean(holiday_pattern):.2f}")
+
+    return {'weekday': weekday_pattern, 'holiday': holiday_pattern}
+
+
 def load_and_preprocess_data(df, max_history_days=90, interval_minutes=None):
     """
     加载并预处理数据 - 优化大数据量处理，支持多种时间间隔
@@ -199,7 +153,7 @@ def load_and_preprocess_data(df, max_history_days=90, interval_minutes=None):
         df: DataFrame，包含 'time', 'value', 'day_type' 列
             - time: 时间戳
             - value: 数值
-            - day_type: 日期类型 (0=工作日, 1=假期, 其他=异常)
+            - day_type: 日期类型 (1=工作日, 0=休息日, 其他=异常)
         max_history_days: 最大历史天数（根据时间间隔自动调整）
         interval_minutes: 时间间隔分钟数（15或60），None表示自动检测
 
@@ -363,7 +317,7 @@ def calculate_day_type_stats(df, anomaly_dates=None):
     return stats
 
 
-def detect_anomaly_days(df, z_threshold=3.0, iqr_multiplier=2.0):
+def detect_anomaly_days(df, z_threshold=3.0, iqr_multiplier=2.0, dynamic_patterns=None):
     """
     检测历史数据中的异常日期
 
@@ -375,6 +329,7 @@ def detect_anomaly_days(df, z_threshold=3.0, iqr_multiplier=2.0):
         df: DataFrame，包含 'time' 和 'value' 列
         z_threshold: Z-score 阈值（默认3.0，即99.7%置信区间外的为异常）
         iqr_multiplier: IQR 倍数（默认2.0）
+        dynamic_patterns: 动态生成的模板 dict{'weekday': array, 'holiday': array}
 
     返回:
         set: 异常日期的集合 (date 对象)
@@ -426,11 +381,15 @@ def detect_anomaly_days(df, z_threshold=3.0, iqr_multiplier=2.0):
         day_data = df[df['date'] == date]['value'].values
 
         if len(day_data) >= 36:  # 至少需要9小时数据
-            # 选择对应模板
+            # 必须使用动态模板
+            if dynamic_patterns is None or not isinstance(dynamic_patterns, dict):
+                print("警告: detect_anomaly_days 需要 dynamic_patterns，跳过模板相似度检测")
+                break
+
             if day_row['is_weekend']:
-                template = HOLIDAY_PATTERN.copy()
+                template = dynamic_patterns.get('holiday').copy()
             else:
-                template = WEEKDAY_PATTERN.copy()
+                template = dynamic_patterns.get('weekday').copy()
 
             # 计算与模板的相似度（使用前9小时或更少）
             observed = day_data[:min(36, len(day_data))]
@@ -459,7 +418,7 @@ def detect_anomaly_days(df, z_threshold=3.0, iqr_multiplier=2.0):
     return anomaly_dates
 
 
-def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False, mode='predict'):
+def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False, mode='predict', dynamic_patterns=None):
     """
     根据前9小时数据特征判断日期类型
 
@@ -476,6 +435,7 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
         is_anomaly: 是否已标记为异常日期
         mode: 'predict' - 预测模式（只返回weekday/holiday）
               'evaluate' - 评估模式（返回weekday/holiday/anomaly）
+        dynamic_patterns: 动态生成的模板 dict{'weekday': array, 'holiday': array}，优先于默认模板
 
     返回:
         'weekday', 'holiday' 或 'anomaly'（仅evaluate模式）
@@ -503,9 +463,15 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
     print(f"  极差: {range_value:.2f}")
     print(f"  趋势(后半-前半): {trend:.2f}")
 
-    # 计算与模板的相似度
-    weekday_similarity = calculate_pattern_similarity(values, WEEKDAY_PATTERN[:len(values)])
-    holiday_similarity = calculate_pattern_similarity(values, HOLIDAY_PATTERN[:len(values)])
+    # 计算与模板的相似度（必须使用动态模板）
+    if dynamic_patterns is None or not isinstance(dynamic_patterns, dict):
+        raise ValueError("detect_day_type requires dynamic_patterns parameter from generate_pattern_from_history()")
+
+    weekday_template = dynamic_patterns.get('weekday')[:len(values)]
+    holiday_template = dynamic_patterns.get('holiday')[:len(values)]
+
+    weekday_similarity = calculate_pattern_similarity(values, weekday_template)
+    holiday_similarity = calculate_pattern_similarity(values, holiday_template)
 
     print(f"  与工作日模板相似度: {weekday_similarity:.4f}")
     print(f"  与假期模板相似度: {holiday_similarity:.4f}")
@@ -635,7 +601,7 @@ def calculate_pattern_similarity(observed, template):
     return max(0, similarity)  # 确保非负
 
 
-def predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stats=None, interval_minutes=15, remaining_times=None):
+def predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stats=None, interval_minutes=15, remaining_times=None, dynamic_patterns=None):
     """
     根据日期类型预测当天剩余时间
 
@@ -647,6 +613,7 @@ def predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stat
         historical_stats: 历史统计特征（用于异常日期预测）
         interval_minutes: 时间间隔分钟数（15或60）
         remaining_times: 预测时间点列表（可选）
+        dynamic_patterns: 动态生成的模板 dict{'weekday': array, 'holiday': array}，优先于默认模板
 
     返回:
         预测结果DataFrame
@@ -702,11 +669,11 @@ def predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stat
     print(f"预测时间范围: {remaining_times[0]} 至 {remaining_times[-1]}")
 
     # 将数值day_type转换为字符串类型
-    # 0=工作日(weekday), 1=假期(holiday), 其他=异常(anomaly)
+    # 1=工作日(weekday), 0=休息日(holiday), 其他=异常(anomaly)
     if isinstance(day_type, (int, float)):
-        if day_type == 0:
+        if day_type == 1:
             day_type_str = 'weekday'
-        elif day_type == 1:
+        elif day_type == 0:
             day_type_str = 'holiday'
         else:
             day_type_str = 'anomaly'
@@ -750,11 +717,15 @@ def predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stat
         upper_factor = 1.30  # 30%上限
 
     else:
-        # 正常日期：使用对应的预定义模板
+        # 正常日期：使用动态生成的模板
+        if dynamic_patterns is None or not isinstance(dynamic_patterns, dict):
+            raise ValueError("predict_remaining_day requires dynamic_patterns parameter from generate_pattern_from_history()")
+
         if day_type_str == 'weekday':
-            base_pattern = config['weekday_pattern'].copy()
+            base_pattern = dynamic_patterns['weekday'].copy()
         else:
-            base_pattern = config['holiday_pattern'].copy()
+            base_pattern = dynamic_patterns['holiday'].copy()
+        print(f"使用动态生成的模板（{day_type_str}）")
 
         # 根据前9小时数据调整模板幅度（如果有当天数据）
         if len(first_9_hours) > 0:
@@ -1145,101 +1116,7 @@ def preprocess_training_data(df, anomaly_dates=None, **kwargs):
     return processor.process(df)
 
 
-def predict_with_prophet_optimized(df, first_9_hours, day_type, remaining_times, max_days=30, anomaly_dates=None, interval_minutes=15):
-    """
-    使用Prophet模型进行预测 - 优化版本，限制训练数据量，支持day_type特征
-
-    参数:
-        df: 历史数据，包含 'time', 'value', 'day_type' 列
-        first_9_hours: 前9小时数据
-        day_type: 日期类型 (0=工作日, 1=假期, 其他=异常)
-        remaining_times: 需要预测的时间点
-        max_days: 最大使用历史天数（默认30天，控制训练时间）
-        anomaly_dates: 异常日期集合，训练时排除
-        interval_minutes: 时间间隔分钟数（15或60）
-    """
-    if not PROPHET_AVAILABLE:
-        return None
-
-    # 获取配置
-    config = get_interval_config(interval_minutes)
-
-    print(f"\n使用Prophet模型进行预测（使用最近{max_days}天数据，{interval_minutes}分钟间隔）...")
-
-    try:
-        # 只使用最近max_days天的数据（减少训练时间）
-        current_date = first_9_hours['time'].iloc[-1]
-        cutoff_date = current_date - timedelta(days=max_days)
-        hist_data = df[df['time'] >= cutoff_date].copy()
-
-        # 排除异常日期的数据
-        if anomaly_dates:
-            original_count = len(hist_data)
-            hist_data = hist_data[~hist_data['time'].dt.date.isin(anomaly_dates)].copy()
-            excluded_count = original_count - len(hist_data)
-            if excluded_count > 0:
-                print(f"  训练数据已排除 {excluded_count} 个异常日期数据点")
-
-        # 根据时间间隔调整最小数据要求
-        min_points = config['intervals_per_day']  # 至少需要1天的数据
-        if len(hist_data) < min_points:
-            print(f"历史数据不足（{len(hist_data)}点 < {min_points}点），使用模板预测")
-            return None
-
-        # Prophet格式
-        prophet_df = hist_data[['time', 'value']].rename(columns={'time': 'ds', 'value': 'y'})
-
-        # 添加day_type作为回归特征（如果历史数据中存在）
-        has_day_type = 'day_type' in hist_data.columns
-        if has_day_type:
-            prophet_df['day_type'] = hist_data['day_type'].values
-
-        # 创建模型（优化参数加快训练）
-        model = Prophet(
-            yearly_seasonality=False,  # 2年数据不需要年季节性
-            weekly_seasonality=True,
-            daily_seasonality=True,
-            interval_width=0.95,
-            changepoint_prior_scale=0.05,
-            seasonality_prior_scale=10.0,
-            # 限制changepoint数量，加快训练
-            n_changepoints=15,
-        )
-
-        # 添加day_type作为回归特征
-        if has_day_type:
-            model.add_regressor('day_type')
-            print("  已添加 day_type 作为回归特征")
-
-        # 训练模型（限制迭代次数）
-        print("训练Prophet模型...")
-        model.fit(prophet_df)
-
-        # 预测未来
-        future = pd.DataFrame({'ds': remaining_times})
-        # 添加预测日期的day_type
-        if has_day_type:
-            future['day_type'] = day_type
-
-        forecast = model.predict(future)
-
-        forecast_df = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].rename(columns={
-            'ds': 'time',
-            'yhat': 'value_predicted',
-            'yhat_lower': 'value_lower',
-            'yhat_upper': 'value_upper'
-        })
-        forecast_df['day_type'] = day_type
-
-        print("Prophet预测完成")
-        return forecast_df
-
-    except Exception as e:
-        print(f"Prophet预测失败: {e}")
-        return None
-
-
-def predict_daily_remaining(input_df, target_date=None, use_prophet=True, max_history_days=None,
+def predict_daily_remaining(input_df, target_date=None, max_history_days=None,
                            interval_minutes=15, detect_anomaly=True, anomaly_z_threshold=3.0,
                            preprocess=True, interpolation_method='linear',
                            outlier_method='iqr', outlier_threshold=1.5):
@@ -1249,7 +1126,6 @@ def predict_daily_remaining(input_df, target_date=None, use_prophet=True, max_hi
     参数:
         input_df: 输入DataFrame，包含 'time' 和 'value' 列
         target_date: 目标日期（默认使用最新日期）
-        use_prophet: 是否尝试使用Prophet模型
         max_history_days: 最大历史天数（None则根据时间间隔自动设置）
         interval_minutes: 时间间隔分钟数（15或60），根据此参数自动调整样本数量
         detect_anomaly: 是否启用异常日期检测
@@ -1357,9 +1233,13 @@ def predict_daily_remaining(input_df, target_date=None, use_prophet=True, max_hi
     print("\n" + "-" * 40)
     print("步骤: 判断日期类型（预测模式）")
     print("-" * 40)
+
+    # 生成动态模板
+    dynamic_patterns = generate_pattern_from_history(df, interval_minutes)
+
     target_date_obj = first_9_hours['time'].iloc[0].date()
     is_target_anomaly = target_date_obj in anomaly_dates
-    day_type = detect_day_type(first_9_hours, historical_stats, is_anomaly=is_target_anomaly, mode='predict')
+    day_type = detect_day_type(first_9_hours, historical_stats, is_anomaly=is_target_anomaly, mode='predict', dynamic_patterns=dynamic_patterns)
 
     # 确定预测时间范围（根据时间间隔）
     last_time = first_9_hours['time'].iloc[-1]
@@ -1375,15 +1255,7 @@ def predict_daily_remaining(input_df, target_date=None, use_prophet=True, max_hi
     print("\n" + "-" * 40)
     print("步骤: 预测当天剩余时间")
     print("-" * 40)
-    if use_prophet and PROPHET_AVAILABLE:
-        forecast_df = predict_with_prophet_optimized(
-            df, first_9_hours, day_type, remaining_times, max_days=config['train_window_days'],
-            anomaly_dates=anomaly_dates, interval_minutes=interval_minutes
-        )
-        if forecast_df is None:
-            forecast_df = predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stats, interval_minutes=interval_minutes, remaining_times=remaining_times)
-    else:
-        forecast_df = predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stats, interval_minutes=interval_minutes, remaining_times=remaining_times)
+    forecast_df = predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stats, interval_minutes=interval_minutes, remaining_times=remaining_times, dynamic_patterns=dynamic_patterns)
 
     elapsed = (datetime.now() - start_time).total_seconds()
     print(f"\n预测完成，总耗时: {elapsed:.2f} 秒")
@@ -1395,18 +1267,22 @@ def predict_daily_remaining(input_df, target_date=None, use_prophet=True, max_hi
 # 双阶段预测函数（简化接口）
 # ============================================================================
 
-def predict_at_midnight(input_df, interval_minutes=15, calendar_day_type_input=0):
+def predict_at_midnight(input_df, interval_minutes=15, calendar_day_type_input=0, max_history_days=None):
     """
     0点预测 - 根据手动输入的日期类型进行预测
 
     参数:
         input_df: 历史数据DataFrame，包含 'time', 'value', 'day_type' 列
-            - day_type: 0=工作日, 1=假期, 其他=异常
+            - day_type: 日期类型 (1=工作日, 0=休息日, 其他=异常)
         interval_minutes: 时间间隔（15或60分钟）
         calendar_day_type_input: 手动输入的当天日期类型
-            - 0: 工作日 (weekday)
-            - 1: 节假日 (holiday)
+            - 1: 工作日 (weekday)
+            - 0: 休息日 (holiday)
             - 其他数字: 异常日期 (anomaly)
+        max_history_days: 最大历史天数
+            - None: 默认使用30天（15分钟）或60天（60分钟）
+            - 0: 使用全部历史数据
+            - 正整数: 使用指定天数
 
     返回:
         预测结果DataFrame，包含当日0-24时的预测值
@@ -1416,23 +1292,36 @@ def predict_at_midnight(input_df, interval_minutes=15, calendar_day_type_input=0
     print("0点预测 - 基于手动输入的日期类型")
     print("=" * 60)
 
-    # 参数转换
-    if calendar_day_type_input == 0:
+    # 参数转换: 1=工作日, 0=休息日
+    if calendar_day_type_input == 1:
         day_type = 'weekday'
-    elif calendar_day_type_input == 1:
+    elif calendar_day_type_input == 0:
         day_type = 'holiday'
     else:
         day_type = 'anomaly'
 
-    day_type_display = {0: '工作日', 1: '节假日'}.get(calendar_day_type_input, '异常日期')
+    day_type_display = {1: '工作日', 0: '休息日'}.get(calendar_day_type_input, '异常日期')
     print(f"\n输入日期类型: {calendar_day_type_input} ({day_type_display})")
     print(f"内部类型: {day_type}")
 
     # 获取配置
     config = get_interval_config(interval_minutes)
 
+    # 处理max_history_days参数
+    # None: 使用默认值, 0: 使用全部数据, 正整数: 使用指定天数
+    if max_history_days is None:
+        use_max_days = config['train_window_days']
+    elif max_history_days == 0:
+        # 计算实际可用天数
+        date_range = (input_df['time'].max() - input_df['time'].min()).days
+        use_max_days = date_range
+    else:
+        use_max_days = max_history_days
+
+    print(f"使用历史数据: 最近 {use_max_days} 天")
+
     # 数据预处理
-    processed_df = preprocess_for_prediction(input_df, interval_minutes=interval_minutes)
+    processed_df = preprocess_for_prediction(input_df, interval_minutes=interval_minutes, max_history_days=use_max_days)
 
     # 获取历史统计
     historical_stats = processed_df.get('historical_stats')
@@ -1456,6 +1345,9 @@ def predict_at_midnight(input_df, interval_minutes=15, calendar_day_type_input=0
     print(f"预测时间范围: {remaining_times[0]} 至 {remaining_times[-1]}")
     print(f"预测点数: {len(remaining_times)}")
 
+    # 生成动态模板
+    dynamic_patterns = generate_pattern_from_history(df, interval_minutes)
+
     # 执行预测
     start_time = datetime.now()
 
@@ -1463,18 +1355,11 @@ def predict_at_midnight(input_df, interval_minutes=15, calendar_day_type_input=0
     first_9_hours = pd.DataFrame(columns=['time', 'value'])
     day_data = pd.DataFrame(columns=['time', 'value'])
 
-    if PROPHET_AVAILABLE:
-        forecast_df = predict_with_prophet_optimized(
-            df, first_9_hours, day_type, remaining_times, max_days=config['train_window_days'],
-            anomaly_dates=anomaly_dates, interval_minutes=interval_minutes
-        )
-        if forecast_df is None:
-            forecast_df = predict_remaining_day(df, first_9_hours, day_type, day_data,
-                                                historical_stats, interval_minutes=interval_minutes)
-    else:
-        forecast_df = predict_remaining_day(df, first_9_hours, day_type, day_data,
-                                            historical_stats, interval_minutes=interval_minutes,
-                                            remaining_times=remaining_times)
+    # 使用模板预测
+    forecast_df = predict_remaining_day(df, first_9_hours, day_type, day_data,
+                                        historical_stats, interval_minutes=interval_minutes,
+                                        remaining_times=remaining_times,
+                                        dynamic_patterns=dynamic_patterns)
 
     elapsed = (datetime.now() - start_time).total_seconds()
     print(f"\n预测完成，耗时: {elapsed:.2f} 秒")
@@ -1482,19 +1367,23 @@ def predict_at_midnight(input_df, interval_minutes=15, calendar_day_type_input=0
     return forecast_df
 
 
-def predict_at_nine(input_df, first_9_hours_df, interval_minutes=15):
+def predict_at_nine(input_df, first_9_hours_df, interval_minutes=15, max_history_days=None):
     """
     9点预测 - 根据0-9点实际数据判断日期类型并预测剩余时间
 
     参数:
         input_df: 历史数据DataFrame，包含 'time', 'value', 'day_type' 列
-            - day_type: 0=工作日, 1=假期, 其他=异常
+            - day_type: 日期类型 (1=工作日, 0=休息日, 其他=异常)
         first_9_hours_df: 当日0-9点实际数据DataFrame，包含 'time' 和 'value' 列
         interval_minutes: 时间间隔（15或60分钟）
+        max_history_days: 最大历史天数
+            - None: 默认使用30天（15分钟）或60天（60分钟）
+            - 0: 使用全部历史数据
+            - 正整数: 使用指定天数
 
     返回:
         tuple: (日期类型, 预测结果DataFrame)
-            - 日期类型: 0(工作日) / 1(假期) / 2(异常)
+            - 日期类型: 1(工作日) / 0(休息日) / 2(异常)
             - 预测结果: 当日9-24时的预测值DataFrame
     """
     print("=" * 60)
@@ -1504,8 +1393,19 @@ def predict_at_nine(input_df, first_9_hours_df, interval_minutes=15):
     # 获取配置
     config = get_interval_config(interval_minutes)
 
+    # 处理max_history_days参数
+    if max_history_days is None:
+        use_max_days = config['train_window_days']
+    elif max_history_days == 0:
+        date_range = (input_df['time'].max() - input_df['time'].min()).days
+        use_max_days = date_range
+    else:
+        use_max_days = max_history_days
+
+    print(f"使用历史数据: 最近 {use_max_days} 天")
+
     # 数据预处理
-    processed_df = preprocess_for_prediction(input_df, interval_minutes=interval_minutes)
+    processed_df = preprocess_for_prediction(input_df, interval_minutes=interval_minutes, max_history_days=use_max_days)
 
     # 获取历史统计
     historical_stats = processed_df.get('historical_stats')
@@ -1522,11 +1422,15 @@ def predict_at_nine(input_df, first_9_hours_df, interval_minutes=15):
     if len(first_9_hours_df) < min_points:
         print(f"警告: 0-9点数据不足({len(first_9_hours_df)}点)，使用全部数据判断")
 
+    # 生成动态模板
+    dynamic_patterns = generate_pattern_from_history(df, interval_minutes)
+
     # 根据0-9点数据判断日期类型
     print("\n--- 日期类型判断 ---")
     is_target_anomaly = target_date in anomaly_dates
     day_type = detect_day_type(first_9_hours_df, historical_stats,
-                                is_anomaly=is_target_anomaly, mode='predict')
+                                is_anomaly=is_target_anomaly, mode='predict',
+                                dynamic_patterns=dynamic_patterns)
 
     day_type_display = {'weekday': '工作日', 'holiday': '节假日', 'anomaly': '异常日期'}
     print(f"推断的日期类型: {day_type} ({day_type_display.get(day_type, day_type)})")
@@ -1547,31 +1451,126 @@ def predict_at_nine(input_df, first_9_hours_df, interval_minutes=15):
     print(f"\n预测时间范围: {remaining_times[0]} 至 {remaining_times[-1]}")
     print(f"预测点数: {len(remaining_times)}")
 
-    # 执行预测
+    # 执行预测（动态模板已在上面生成）
     start_time = datetime.now()
 
-    if PROPHET_AVAILABLE:
-        forecast_df = predict_with_prophet_optimized(
-            df, first_9_hours_df, day_type, remaining_times, max_days=config['train_window_days'],
-            anomaly_dates=anomaly_dates, interval_minutes=interval_minutes
-        )
-        if forecast_df is None:
-            forecast_df = predict_remaining_day(df, first_9_hours_df, day_type, day_data,
-                                                historical_stats, interval_minutes=interval_minutes,
-                                                remaining_times=remaining_times)
-    else:
-        forecast_df = predict_remaining_day(df, first_9_hours_df, day_type, day_data,
-                                            historical_stats, interval_minutes=interval_minutes,
-                                            remaining_times=remaining_times)
+    # 使用模板预测
+    forecast_df = predict_remaining_day(df, first_9_hours_df, day_type, day_data,
+                                        historical_stats, interval_minutes=interval_minutes,
+                                        remaining_times=remaining_times,
+                                        dynamic_patterns=dynamic_patterns)
 
     elapsed = (datetime.now() - start_time).total_seconds()
     print(f"\n预测完成，耗时: {elapsed:.2f} 秒")
 
     # 将字符串日期类型转换为数值类型返回
     # weekday=0, holiday=1, anomaly=2
-    day_type_numeric = 0 if day_type == 'weekday' else (1 if day_type == 'holiday' else 2)
+    day_type_numeric = 1 if day_type == 'weekday' else (0 if day_type == 'holiday' else 2)
 
     return day_type_numeric, forecast_df
+
+
+def evaluate_forecast_accuracy(forecast_df, actual_df, interval_minutes=15):
+    """
+    评估预测准确性 - 对比预测数据与实际数据
+
+    参数:
+        forecast_df: 当天预测数据DataFrame，包含 'time' 和 'value_predicted' 列
+        actual_df: 当天实际数据DataFrame，包含 'time' 和 'value' 列
+        interval_minutes: 时间间隔（15或60）
+
+    返回:
+        dict: 包含各种评估指标的字典
+            - mape: 平均绝对百分比误差 (%)
+            - mae: 平均绝对误差
+            - rmse: 均方根误差
+            - r2: R²决定系数
+            - points_compared: 对比的数据点数
+    """
+    print("=" * 60)
+    print("预测准确性评估")
+    print("=" * 60)
+
+    if len(actual_df) == 0:
+        raise ValueError("实际数据为空")
+    if len(forecast_df) == 0:
+        raise ValueError("预测数据为空")
+
+    # 确保有预测值列
+    if 'value_predicted' in forecast_df.columns:
+        pred_col = 'value_predicted'
+    elif 'value' in forecast_df.columns:
+        pred_col = 'value'
+    else:
+        raise ValueError("预测数据缺少value列")
+
+    actual_df = actual_df.copy()
+    forecast_df = forecast_df.copy()
+
+    print(f"\n时间间隔: {interval_minutes}分钟")
+    print(f"预测数据点数: {len(forecast_df)}")
+    print(f"实际数据点数: {len(actual_df)}")
+
+    # 对齐时间点
+    actual_df = actual_df.set_index('time')
+    forecast_df = forecast_df.set_index('time')
+
+    # 找到共同的时间点
+    common_times = actual_df.index.intersection(forecast_df.index)
+    print(f"共同时间点数: {len(common_times)}")
+
+    if len(common_times) == 0:
+        print("警告: 预测与实际数据没有时间重叠")
+        return None
+
+    # 提取对齐后的数据
+    actual_values = actual_df.loc[common_times, 'value'].values
+    forecast_values = forecast_df.loc[common_times, pred_col].values
+
+    # 计算各项评估指标
+    # MAE (Mean Absolute Error)
+    mae = np.mean(np.abs(actual_values - forecast_values))
+
+    # MAPE (Mean Absolute Percentage Error)
+    mask = actual_values != 0
+    if np.any(mask):
+        mape = np.mean(np.abs((actual_values[mask] - forecast_values[mask]) / actual_values[mask])) * 100
+    else:
+        mape = 0.0
+
+    # RMSE (Root Mean Squared Error)
+    rmse = np.sqrt(np.mean((actual_values - forecast_values) ** 2))
+
+    # R² (Coefficient of Determination)
+    ss_res = np.sum((actual_values - forecast_values) ** 2)
+    ss_tot = np.sum((actual_values - np.mean(actual_values)) ** 2)
+    r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+
+    # 偏差分析
+    bias = np.mean(forecast_values - actual_values)
+    bias_pct = np.mean((forecast_values - actual_values) / (actual_values + 1e-8)) * 100
+
+    # 输出结果
+    print(f"\n评估指标:")
+    print(f"  MAE   (平均绝对误差): {mae:.2f}")
+    print(f"  MAPE  (平均绝对百分比误差): {mape:.2f}%")
+    print(f"  RMSE  (均方根误差): {rmse:.2f}")
+    print(f"  R²    (决定系数): {r2:.4f}")
+    print(f"  BIAS  (平均偏差): {bias:.2f}")
+    print(f"  BIAS% (平均偏差百分比): {bias_pct:.2f}%")
+
+    result = {
+        'mape': mape,
+        'mae': mae,
+        'rmse': rmse,
+        'r2': r2,
+        'bias': bias,
+        'bias_pct': bias_pct,
+        'points_compared': len(common_times)
+    }
+
+    print(f"\n评估完成")
+    return result
 
 
 def evaluate_day_type_by_comparison(forecast_df, actual_df):
@@ -1673,7 +1672,7 @@ def preprocess_for_prediction(input_df, interval_minutes=15, max_history_days=No
     }
 
 
-def evaluate_day_type(full_day_data, historical_stats=None, anomaly_dates=None, interval_minutes=15):
+def evaluate_day_type(full_day_data, historical_stats=None, anomaly_dates=None, interval_minutes=15, dynamic_patterns=None):
     """
     24小时后评估当天的日期类型（完整数据评估）
 
@@ -1687,6 +1686,7 @@ def evaluate_day_type(full_day_data, historical_stats=None, anomaly_dates=None, 
         historical_stats: 历史统计数据
         anomaly_dates: 已检测到的异常日期集合
         interval_minutes: 时间间隔分钟数（15或60）
+        dynamic_patterns: 动态生成的模板 dict{'weekday': array, 'holiday': array}
 
     返回:
         'weekday', 'holiday' 或 'anomaly'
@@ -1740,8 +1740,12 @@ def evaluate_day_type(full_day_data, historical_stats=None, anomaly_dates=None, 
         # 数据不足，用边缘值填充
         full_values = np.pad(values, (0, intervals_per_day - len(values)), mode='edge')
 
-    weekday_pattern = config['weekday_pattern']
-    holiday_pattern = config['holiday_pattern']
+    # 必须使用动态模板
+    if dynamic_patterns is None or not isinstance(dynamic_patterns, dict):
+        raise ValueError("evaluate_day_type requires dynamic_patterns parameter from generate_pattern_from_history()")
+
+    weekday_pattern = dynamic_patterns.get('weekday')
+    holiday_pattern = dynamic_patterns.get('holiday')
 
     weekday_similarity = calculate_pattern_similarity(full_values, weekday_pattern)
     holiday_similarity = calculate_pattern_similarity(full_values, holiday_pattern)
@@ -1849,8 +1853,8 @@ def generate_sample_data(days=800, pattern_type='mixed', interval_minutes=15):
         hour = t.hour
         is_weekend = t.weekday() >= 5
 
-        # 设置day_type: 0=工作日, 1=假期
-        day_type = 1 if is_weekend else 0
+        # 设置day_type: 1=工作日, 0=休息日
+        day_type = 0 if is_weekend else 1
 
         # 季节性因子（年周期）
         day_of_year = t.timetuple().tm_yday
@@ -1899,7 +1903,7 @@ if __name__ == '__main__':
     # 执行预测
     try:
         # 使用默认参数（自动截取最近90天）
-        value_predict_df = predict_daily_remaining(sample_df, use_prophet=False)
+        value_predict_df = predict_daily_remaining(sample_df)
 
         # 显示结果
         print("\n" + "=" * 60)
