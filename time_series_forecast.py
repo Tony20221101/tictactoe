@@ -418,7 +418,7 @@ def detect_anomaly_days(df, z_threshold=3.0, iqr_multiplier=2.0, dynamic_pattern
     return anomaly_dates
 
 
-def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False, mode='predict', dynamic_patterns=None):
+def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False, mode='predict', dynamic_patterns=None, history_df=None):
     """
     根据前9小时数据特征判断日期类型
 
@@ -436,6 +436,7 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
         mode: 'predict' - 预测模式（只返回weekday/holiday）
               'evaluate' - 评估模式（返回weekday/holiday/anomaly）
         dynamic_patterns: 动态生成的模板 dict{'weekday': array, 'holiday': array}，优先于默认模板
+        history_df: 用于动态计算阈值的历史数据DataFrame（可选）
 
     返回:
         'weekday', 'holiday' 或 'anomaly'（仅evaluate模式）
@@ -476,6 +477,42 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
     print(f"  与工作日模板相似度: {weekday_similarity:.4f}")
     print(f"  与假期模板相似度: {holiday_similarity:.4f}")
 
+    # ===== 动态计算阈值 =====
+    threshold_similarity = 0.3  # 默认相似度阈值
+    threshold_trend = 5  # 默认趋势阈值
+    threshold_range_min = 5  # 默认最小极差
+    threshold_range_max = 300  # 默认最大极差
+
+    # 如果提供了历史数据，动态计算阈值
+    if history_df is not None and len(history_df) > 0:
+        history_df = history_df.copy()
+        history_df['time'] = pd.to_datetime(history_df['time'])
+
+        # 计算前9小时子窗口的历史统计
+        history_df['hour'] = history_df['time'].dt.hour
+        first_9_hours_history = history_df[history_df['hour'] < 9]
+
+        if len(first_9_hours_history) > 0:
+            # 动态趋势阈值：使用前9小时数据标准差的10%
+            threshold_trend = first_9_hours_history['value'].std() * 0.1
+            # 动态极差阈值：基于前9小时的极差统计
+            range_values = first_9_hours_history.groupby(first_9_hours_history['time'].dt.date)['value'].apply(lambda x: x.max() - x.min())
+            if len(range_values) > 0:
+                threshold_range_min = max(5, range_values.quantile(0.05))  # 5%分位数
+                threshold_range_max = min(300, range_values.quantile(0.95))  # 95%分位数
+            # 动态相似度阈值：使用历史相似度的20%分位数
+            if 'weekday' in dynamic_patterns and 'holiday' in dynamic_patterns:
+                # 计算模板自身的对比作为基准
+                wd_temp = dynamic_patterns['weekday'][:len(values)]
+                hl_temp = dynamic_patterns['holiday'][:len(values)]
+                self_similarity = calculate_pattern_similarity(wd_temp, hl_temp)
+                threshold_similarity = max(0.2, self_similarity * 0.5)
+
+    print(f"\n动态阈值:")
+    print(f"  趋势阈值: {threshold_trend:.2f}")
+    print(f"  极差阈值: [{threshold_range_min:.2f}, {threshold_range_max:.2f}]")
+    print(f"  相似度阈值: {threshold_similarity:.4f}")
+
     # 仅在evaluate模式下进行异常检测
     if mode == 'evaluate':
         # 如果已标记为异常，直接返回
@@ -493,7 +530,7 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
         is_anomaly_detected = False
         anomaly_reasons = []
 
-        if max_similarity < 0.3:  # 与任何模板都不相似
+        if max_similarity < threshold_similarity:  # 与任何模板都不相似
             is_anomaly_detected = True
             anomaly_reasons.append(f"与模板相似度过低({max_similarity:.3f})")
 
@@ -514,12 +551,12 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
                     anomaly_reasons.append(f"均值偏离假期统计({abs(mean_value - hl_mean):.1f} > 3σ)")
 
         # 实时异常：极差异常
-        if range_value < 5:  # 几乎无变化
+        if range_value < threshold_range_min:  # 几乎无变化
             is_anomaly_detected = True
-            anomaly_reasons.append("极差过小(几乎无波动)")
-        elif range_value > 300:  # 变化过于剧烈
+            anomaly_reasons.append(f"极差过小({range_value:.1f} < {threshold_range_min:.1f})")
+        elif range_value > threshold_range_max:  # 变化过于剧烈
             is_anomaly_detected = True
-            anomaly_reasons.append("极差过大(变化过于剧烈)")
+            anomaly_reasons.append(f"极差过大({range_value:.1f} > {threshold_range_max:.1f})")
 
         if is_anomaly_detected:
             print(f"\n判断结果: ANOMALY (检测到异常)")
@@ -555,12 +592,12 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
         print(f"  -> 波动性({std_value:.1f}) <= 阈值({threshold_std:.1f})，倾向假期")
 
     # 规则3: 趋势判断（工作日早上通常上升）
-    if trend > 5:
+    if trend > threshold_trend:
         weekday_score += 1
-        print("  -> 有明显上升趋势，倾向工作日")
-    elif trend < -5:
+        print(f"  -> 有明显上升趋势({trend:.2f} > {threshold_trend:.2f})，倾向工作日")
+    elif trend < -threshold_trend:
         holiday_score += 1
-        print("  -> 有明显下降趋势，倾向假期")
+        print(f"  -> 有明显下降趋势({trend:.2f} < {-threshold_trend:.2f})，倾向假期")
 
     # 规则4: 模板相似度
     if weekday_similarity > holiday_similarity:
@@ -1239,7 +1276,7 @@ def predict_daily_remaining(input_df, target_date=None, max_history_days=None,
 
     target_date_obj = first_9_hours['time'].iloc[0].date()
     is_target_anomaly = target_date_obj in anomaly_dates
-    day_type = detect_day_type(first_9_hours, historical_stats, is_anomaly=is_target_anomaly, mode='predict', dynamic_patterns=dynamic_patterns)
+    day_type = detect_day_type(first_9_hours, historical_stats, is_anomaly=is_target_anomaly, mode='predict', dynamic_patterns=dynamic_patterns, history_df=df)
 
     # 确定预测时间范围（根据时间间隔）
     last_time = first_9_hours['time'].iloc[-1]
@@ -1430,7 +1467,7 @@ def predict_at_nine(input_df, first_9_hours_df, interval_minutes=15, max_history
     is_target_anomaly = target_date in anomaly_dates
     day_type = detect_day_type(first_9_hours_df, historical_stats,
                                 is_anomaly=is_target_anomaly, mode='predict',
-                                dynamic_patterns=dynamic_patterns)
+                                dynamic_patterns=dynamic_patterns, history_df=df)
 
     day_type_display = {'weekday': '工作日', 'holiday': '节假日', 'anomaly': '异常日期'}
     print(f"推断的日期类型: {day_type} ({day_type_display.get(day_type, day_type)})")
