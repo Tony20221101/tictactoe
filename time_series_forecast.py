@@ -1,8 +1,8 @@
 """
-时序数据预测脚本 - 支持2年以上历史数据
-输入：包含 time, value, day_type 三列的 DataFrame（支持15分钟或60分钟间隔）
+时序数据预测脚本 - 支持多列时序预测
+输入：包含 time, Index_1, Index_2, ..., Index_n, day_type 列的 DataFrame（支持5分钟、15分钟或60分钟间隔）
       day_type: 1=工作日, 0=休息日, 其他=异常
-输出：当天剩余时间的value预测
+输出：当天剩余时间的各索引预测 DataFrame
 
 预测逻辑：
 1. 0点预测：根据用户输入的预设日期类型进行预测
@@ -10,10 +10,9 @@
 3. 使用动态模板匹配进行预测
 
 性能优化：
-- 支持大数据量（2年+），自动采样最近90天数据用于分析
-- 支持多种时间间隔（15分钟/60分钟），自动调整样本数量
-- 高效的日期类型判断算法
-- 使用动态生成的模板，准确匹配数据特征
+- 支持大数据量（2年+），自动采样最近N天数据用于分析
+- 支持多种时间间隔（5分钟/15分钟/60分钟），自动调整样本数量
+- 支持多列时序同时预测
 
 环境要求：无GPU，运行时间控制在30分钟内
 """
@@ -31,12 +30,23 @@ def get_interval_config(interval_minutes=15):
     获取时间间隔配置参数
 
     参数:
-        interval_minutes: 时间间隔分钟数（15或60）
+        interval_minutes: 时间间隔分钟数（5、15或60）
 
     返回:
         配置参数字典，包含点数计算、频率字符串等
     """
-    if interval_minutes == 15:
+    if interval_minutes == 5:
+        return {
+            'interval_minutes': 5,
+            'intervals_per_day': 288,       # 24小时 * 12
+            'intervals_per_hour': 12,
+            'hours_for_detection': 9,
+            'points_for_detection': 108,     # 9小时 * 12
+            'freq': '5min',
+            'min_daily_points': 144,         # 至少半天数据
+            'stats_window_days': 360         # 统计窗口：360天
+        }
+    elif interval_minutes == 15:
         return {
             'interval_minutes': 15,
             'intervals_per_day': 96,        # 24小时 * 4
@@ -45,8 +55,7 @@ def get_interval_config(interval_minutes=15):
             'points_for_detection': 36,       # 9小时 * 4
             'freq': '15min',
             'min_daily_points': 48,           # 至少半天数据
-            'stats_window_days': 90,          # 统计窗口：90天
-            'train_window_days': 30           # 训练窗口：30天
+            'stats_window_days': 360          # 统计窗口：360天
         }
     elif interval_minutes == 60:
         return {
@@ -57,11 +66,25 @@ def get_interval_config(interval_minutes=15):
             'points_for_detection': 9,          # 9小时 * 1
             'freq': '60min',
             'min_daily_points': 12,            # 至少半天数据
-            'stats_window_days': 180,          # 统计窗口：180天（样本较少，需要更长的窗口）
-            'train_window_days': 60            # 训练窗口：60天
+            'stats_window_days': 360           # 统计窗口：360天
         }
     else:
-        raise ValueError(f"不支持的时间间隔: {interval_minutes}分钟，仅支持15或60分钟")
+        raise ValueError(f"不支持的时间间隔: {interval_minutes}分钟，仅支持5、15或60分钟")
+
+
+def detect_index_columns(df):
+    """
+    检测数据中的索引列（除time和day_type外的所有数值列）
+
+    参数:
+        df: DataFrame
+
+    返回:
+        list: 索引列名列表
+    """
+    reserved_cols = ['time', 'day_type']
+    index_cols = [col for col in df.columns if col not in reserved_cols and df[col].dtype in ['int64', 'float64', 'int32', 'float32']]
+    return index_cols
 
 
 def detect_interval(df):
@@ -72,93 +95,273 @@ def detect_interval(df):
         df: DataFrame，包含 'time' 列
 
     返回:
-        时间间隔分钟数（15或60）
+        时间间隔分钟数（5、15或60）
     """
     time_diff = df['time'].diff().dropna().median()
     interval_minutes = int(time_diff.total_seconds() / 60)
 
-    # 处理接近15或60分钟的值
-    if 10 <= interval_minutes <= 20:
+    # 处理接近5、15或60分钟的值
+    if 3 <= interval_minutes <= 7:
+        return 5
+    elif 10 <= interval_minutes <= 20:
         return 15
     elif 50 <= interval_minutes <= 70:
         return 60
     else:
         # 如果不符合标准间隔，返回最接近的标准值
-        if interval_minutes < 35:
+        if interval_minutes < 10:
+            return 5
+        elif interval_minutes < 35:
             return 15
         else:
             return 60
 
 
-def generate_pattern_from_history(df, interval_minutes=15):
+def detect_trend(df, col_name, interval_minutes=15, window_days=14):
     """
-    根据历史数据动态生成工作日和假期的模式模板
+    检测趋势：将模板数据（历史平均）与最近N天的数据对比，得到趋势系数
+
+    方法：
+    1. 生成历史模板（所有日期的平均模式）
+    2. 计算最近N天每个时间点的平均值
+    3. 对比两者，计算每个时间点的趋势因子 = 最近N天均值 / 模板均值
 
     参数:
-        df: DataFrame，包含 'time', 'value', 'day_type' 列
-        interval_minutes: 时间间隔（15或60）
+        df: DataFrame，包含 'time' 和目标列，以及 'day_type' 列
+        col_name: 列名
+        interval_minutes: 时间间隔（5、15或60）
+        window_days: 用于对比的最近天数（默认14天）
 
     返回:
-        dict: {'weekday': array, 'holiday': array}
-            - weekday: 工作日平均模式数组 (96点 for 15min, 24点 for 60min)
-            - holiday: 假期平均模式数组
+        dict: {
+            'trend_factors': {时间点: 趋势因子},  # 如 {"09:00": 1.05, "09:15": 1.02, ...}
+            'template_mean': float,  # 模板整体均值
+            'recent_mean': float,    # 最近N天整体均值
+            'overall_trend': float,  # 整体趋势因子
+            'window_days': int,      # 实际使用的天数
+            'valid_points': int      # 有效时间点数
+        }
+
+    趋势因子说明：
+    - trend_factors > 1: 该时间点近期比历史平均更高（上涨趋势）
+    - trend_factors < 1: 该时间点近期比历史平均更低（下跌趋势）
+    - trend_factors ≈ 1: 无明显趋势
     """
     df = df.copy()
     df['time'] = pd.to_datetime(df['time'])
 
-    # 提取日期
+    # 获取配置
+    config = get_interval_config(interval_minutes)
+    points_per_day = config['intervals_per_day']
+
+    # 计算截止日期
+    latest_date = df['time'].max().date()
+    cutoff_date = latest_date - timedelta(days=window_days)
+
+    # 添加辅助列
     df['date'] = df['time'].dt.date
+    df['time_of_day'] = df['time'].dt.strftime('%H:%M')
 
-    # 根据interval计算每天的总点数
+    # 分离历史数据和最近N天数据
+    historical_df = df[df['date'] < cutoff_date].copy()
+    recent_df = df[df['date'] >= cutoff_date].copy()
+
+    if len(recent_df) < 10:
+        # 数据不足，返回默认趋势因子
+        return {
+            'trend_factors': {},
+            'template_mean': 0,
+            'recent_mean': 0,
+            'overall_trend': 1.0,
+            'window_days': len(recent_df),
+            'valid_points': 0
+        }
+
+    # 1. 计算历史模板（基于day_type区分工作日/假期，这里用全部数据）
+    historical_template = historical_df.groupby('time_of_day')[col_name].mean()
+    template_mean = historical_template.mean()
+
+    # 2. 计算最近N天每个时间点的均值
+    recent_mean_by_time = recent_df.groupby('time_of_day')[col_name].mean()
+
+    # 3. 对齐时间点，计算趋势因子
+    common_times = list(set(historical_template.index) & set(recent_mean_by_time.index))
+    common_times.sort()
+
+    trend_factors = {}
+    valid_points = 0
+
+    for time_str in common_times:
+        template_val = historical_template.get(time_str, 0)
+        recent_val = recent_mean_by_time.get(time_str, 0)
+
+        if template_val != 0 and not np.isnan(template_val) and not np.isnan(recent_val):
+            trend_factors[time_str] = recent_val / template_val
+            valid_points += 1
+
+    # 计算整体均值和趋势
+    recent_mean = recent_df[col_name].mean()
+    overall_trend = recent_mean / template_mean if template_mean != 0 else 1.0
+
+    # 统计趋势方向
+    up_count = sum(1 for f in trend_factors.values() if f > 1.05)
+    down_count = sum(1 for f in trend_factors.values() if f < 0.95)
+
+    print(f"  趋势检测: 最近{window_days}天 vs 历史模板")
+    print(f"    模板均值={template_mean:.2f}, 最近均值={recent_mean:.2f}")
+    print(f"    整体趋势因子={overall_trend:.3f}")
+    print(f"    有效时间点: {valid_points}个 (上涨:{up_count}, 下跌:{down_count})")
+
+    return {
+        'trend_factors': trend_factors,
+        'template_mean': template_mean,
+        'recent_mean': recent_mean,
+        'overall_trend': overall_trend,
+        'window_days': window_days,
+        'valid_points': valid_points
+    }
+
+
+def generate_pattern_from_history(df, interval_minutes=15, detect_trend_flag=True, trend_window_days=14):
+    """
+    根据历史数据动态生成工作日和假期的模式模板（支持多列）
+
+    参数:
+        df: DataFrame，包含 'time', 'Index_1', 'Index_2', ..., 'day_type' 列
+        interval_minutes: 时间间隔（5、15或60）
+        detect_trend_flag: 是否检测趋势
+        trend_window_days: 趋势检测使用的最近天数（默认14天）
+
+    返回:
+        dict: 每列的模板字典
+        {
+            'Index_1': {
+                'weekday': array,  # 工作日模板
+                'holiday': array,  # 假期模板
+                'trend': {...},    # 趋势信息 {"09:00": {...}, "10:00": {...}, ...}
+                'scope': {...}     # 数据范围信息
+            },
+            'Index_2': {...},
+            ...
+        }
+
+    注：趋势定义为同一时刻（如每天9:00）在历史不同日期上的变化趋势
+    """
+    df = df.copy()
+    df['time'] = pd.to_datetime(df['time'])
+
+    # 检测索引列
+    index_cols = detect_index_columns(df)
+
+    if len(index_cols) == 0:
+        raise ValueError("未检测到索引列，请检查数据格式")
+
+    # 为每个索引列生成模板
+    result = {}
+
+    # 计算整体数据范围
+    df['date'] = df['time'].dt.date
+    all_dates = sorted(df['date'].unique())
+    data_start_date = all_dates[0] if all_dates else None
+    data_end_date = all_dates[-1] if all_dates else None
+
+    for col in index_cols:
+        result[col] = _generate_pattern_for_column(df, col, interval_minutes)
+
+        # 检测趋势：模板数据 vs 最近N天数据
+        if detect_trend_flag:
+            trend_info = detect_trend(df, col, interval_minutes=interval_minutes, window_days=trend_window_days)
+            result[col]['trend'] = trend_info
+
+        # 计算数据范围(scope)
+        col_data = df[col].dropna()
+        result[col]['scope'] = {
+            'points': len(col_data),
+            'start_date': data_start_date,
+            'end_date': data_end_date,
+            'min': float(col_data.min()),
+            'max': float(col_data.max()),
+            'mean': float(col_data.mean()),
+            'std': float(col_data.std())
+        }
+
+    print(f"\n从历史数据生成模板（间隔{interval_minutes}分钟）:")
+    print(f"数据范围: {data_start_date} 至 {data_end_date}, 共{len(all_dates)}天")
+    for col in index_cols:
+        scope = result[col]['scope']
+        weekday_mean = np.mean(result[col]['weekday'])
+        holiday_mean = np.mean(result[col]['holiday'])
+        print(f"  {col}:")
+        print(f"    Scope: {scope['points']}点, 均值={scope['mean']:.2f}, 标准差={scope['std']:.2f}, 范围=[{scope['min']:.1f}, {scope['max']:.1f}]")
+        print(f"    模板: weekday均值={weekday_mean:.2f}, holiday均值={holiday_mean:.2f}")
+        if detect_trend_flag and 'trend' in result[col]:
+            trend = result[col]['trend']
+            if isinstance(trend, dict) and trend.get('valid_points', 0) > 0:
+                # 打印趋势信息
+                overall = trend.get('overall_trend', 1.0)
+                valid = trend.get('valid_points', 0)
+                print(f"    趋势: 整体因子={overall:.3f}, 有效时间点={valid}个")
+
+    return result
+
+
+def _generate_single_pattern(df, interval_minutes):
+    """为单列value生成模板（兼容旧版本）"""
     points_per_day = int(24 * 60 / interval_minutes)
-
-    # 按日期分组，计算每天每个时刻的平均值
     df['time_of_day'] = df['time'].dt.hour * 60 + df['time'].dt.minute
-
-    # 将time_of_day转换为点序号 (0 到 points_per_day-1)
     df['point_index'] = (df['time_of_day'] / interval_minutes).astype(int) % points_per_day
 
-    # 分离工作日和假期数据
     weekday_data = df[df['day_type'] == 1]
     holiday_data = df[df['day_type'] == 0]
 
-    # 计算每个时间点的平均值
     weekday_pattern = weekday_data.groupby('point_index')['value'].mean().sort_index()
     holiday_pattern = holiday_data.groupby('point_index')['value'].mean().sort_index()
 
-    # 填充缺失的时间点（如果有）
     all_indices = np.arange(points_per_day)
-    weekday_pattern = weekday_pattern.reindex(all_indices)
-    holiday_pattern = holiday_pattern.reindex(all_indices)
-
-    # 填充NaN值（使用整体均值）
-    weekday_pattern = weekday_pattern.fillna(weekday_pattern.mean())
-    holiday_pattern = holiday_pattern.fillna(holiday_pattern.mean())
-
-    weekday_pattern = weekday_pattern.values
-    holiday_pattern = holiday_pattern.values
+    weekday_pattern = weekday_pattern.reindex(all_indices).fillna(weekday_pattern.mean())
+    holiday_pattern = holiday_pattern.reindex(all_indices).fillna(holiday_pattern.mean())
 
     print(f"\n从历史数据生成模板（间隔{interval_minutes}分钟，{points_per_day}点/天）:")
     print(f"  工作日模板: {len(weekday_pattern)}点, 均值={np.mean(weekday_pattern):.2f}")
     print(f"  假期模板: {len(holiday_pattern)}点, 均值={np.mean(holiday_pattern):.2f}")
 
-    return {'weekday': weekday_pattern, 'holiday': holiday_pattern}
+    return {'weekday': weekday_pattern.values, 'holiday': holiday_pattern.values}
+
+
+def _generate_pattern_for_column(df, col_name, interval_minutes):
+    """为指定列生成工作日和假期模板"""
+    points_per_day = int(24 * 60 / interval_minutes)
+    df_temp = df.copy()
+    df_temp['time_of_day'] = df_temp['time'].dt.hour * 60 + df_temp['time'].dt.minute
+    df_temp['point_index'] = (df_temp['time_of_day'] / interval_minutes).astype(int) % points_per_day
+
+    weekday_data = df_temp[df_temp['day_type'] == 1]
+    holiday_data = df_temp[df_temp['day_type'] == 0]
+
+    weekday_pattern = weekday_data.groupby('point_index')[col_name].mean().sort_index()
+    holiday_pattern = holiday_data.groupby('point_index')[col_name].mean().sort_index()
+
+    all_indices = np.arange(points_per_day)
+    weekday_pattern = weekday_pattern.reindex(all_indices).fillna(weekday_pattern.mean())
+    holiday_pattern = holiday_pattern.reindex(all_indices).fillna(holiday_pattern.mean())
+
+    return {'weekday': weekday_pattern.values, 'holiday': holiday_pattern.values}
 
 
 def load_and_preprocess_data(df, max_history_days=90, interval_minutes=None):
     """
-    加载并预处理数据 - 优化大数据量处理，支持多种时间间隔
+    加载并预处理数据 - 支持多列索引
 
     参数:
-        df: DataFrame，包含 'time', 'value', 'day_type' 列
+        df: DataFrame，包含 'time', 'Index_1', 'Index_2', ..., 'day_type' 列
             - time: 时间戳
-            - value: 数值
+            - Index_N: 数值列
             - day_type: 日期类型 (1=工作日, 0=休息日, 其他=异常)
-        max_history_days: 最大历史天数（根据时间间隔自动调整）
+        max_history_days: 最大历史天数
         interval_minutes: 时间间隔分钟数（15或60），None表示自动检测
 
     返回:
-        预处理后的DataFrame（仅包含最近max_history_days天的数据）
+        预处理后的DataFrame
     """
     df = df.copy()
 
@@ -184,31 +387,41 @@ def load_and_preprocess_data(df, max_history_days=90, interval_minutes=None):
     cutoff_date = df['time'].max() - timedelta(days=max_history_days)
     df = df[df['time'] >= cutoff_date].copy()
 
-    # 计算实际时间间隔
-    time_diff = df['time'].diff().dropna().median()
-
     print(f"时间间隔: {interval_minutes}分钟 ({config['intervals_per_day']}点/天)")
     print(f"原始数据点数: {original_count} ({original_start.date()} 至 {original_end.date()})")
     print(f"处理后数据点数: {len(df)} ({df['time'].min().date()} 至 {df['time'].max().date()})")
-    print(f"每天数据点数: {config['intervals_per_day']}, 检测时长: {config['hours_for_detection']}小时 ({config['points_for_detection']}点)")
 
     if original_count > len(df):
         print(f"已自动截取最近 {max_history_days} 天数据用于分析")
 
-    # 处理缺失值
-    if df['value'].isnull().sum() > 0:
-        print(f"检测到 {df['value'].isnull().sum()} 个缺失值，使用线性插值填充")
-        df['value'] = df['value'].interpolate(method='linear')
+    # 检测索引列并处理缺失值
+    index_cols = detect_index_columns(df)
+    for col in index_cols:
+        if df[col].isnull().sum() > 0:
+            print(f"检测到 {col} 列 {df[col].isnull().sum()} 个缺失值，使用线性插值填充")
+            df[col] = df[col].interpolate(method='linear')
 
-    # 处理day_type列（如果存在）
+    # 处理day_type列
     if 'day_type' in df.columns:
-        # 处理day_type缺失值：使用前向填充
         if df['day_type'].isnull().sum() > 0:
             null_count = df['day_type'].isnull().sum()
             print(f"检测到 {null_count} 个day_type缺失值，使用前向填充")
             df['day_type'] = df['day_type'].ffill().bfill()
-        # 确保day_type为数值类型
         df['day_type'] = pd.to_numeric(df['day_type'], errors='coerce').fillna(0).astype(int)
+
+        # 检测day_type异常值（不是0或1的值）
+        df['date'] = df['time'].dt.date
+        invalid_day_types = df[(df['day_type'] != 0) & (df['day_type'] != 1)]
+        if len(invalid_day_types) > 0:
+            anomaly_dates_from_day_type = invalid_day_types['date'].unique()
+            print(f"检测到 {len(invalid_day_types)} 个day_type异常值（不是0或1）")
+            print(f"  异常日期: {list(anomaly_dates_from_day_type[:10])}{'...' if len(anomaly_dates_from_day_type) > 10 else ''}")
+            # 将异常值替换为NaN，后续排除这些日期
+            df.loc[invalid_day_types.index, 'day_type'] = np.nan
+
+        # 清理临时列
+        if 'date' in df.columns:
+            df.drop('date', axis=1, inplace=True)
 
     return df
 
@@ -257,38 +470,43 @@ def get_first_9_hours_data(df, target_date=None, interval_minutes=15):
 
 def calculate_day_type_stats(df, anomaly_dates=None):
     """
-    根据历史数据计算工作日和假期的统计特征
-    用于辅助日期类型判断
+    根据历史数据计算工作日和假期的统计特征（支持多列）
 
     参数:
-        df: DataFrame，包含 'time' 和 'value' 列
-        anomaly_dates: 异常日期集合，这些日期会被排除在统计之外
+        df: DataFrame，包含 'time' 和索引列
+        anomaly_dates: 异常日期集合
 
     返回:
-        包含工作日和假期统计特征的字典，同时包含样本数量信息
+        包含工作日和假期统计特征的字典
     """
-    # 添加日期类型标记
     df = df.copy()
     df['date'] = df['time'].dt.date
     df['hour'] = df['time'].dt.hour
     df['is_weekend'] = df['time'].dt.weekday >= 5
 
-    # 过滤掉异常日期
+    # 过滤异常日期
     if anomaly_dates:
         original_dates = df['date'].nunique()
         df = df[~df['date'].isin(anomaly_dates)].copy()
         remaining_dates = df['date'].nunique()
         print(f"  统计计算已排除 {len(anomaly_dates)} 个异常日期，剩余 {remaining_dates} 个有效日期")
 
+    # 检测索引列，使用第一个进行统计
+    index_cols = detect_index_columns(df)
+    if len(index_cols) == 0:
+        return {}
+
+    value_col = index_cols[0]
+
     # 按日期聚合
     daily_stats = df.groupby('date').agg({
-        'value': ['mean', 'std', 'min', 'max'],
+        value_col: ['mean', 'std', 'min', 'max'],
         'is_weekend': 'first'
     }).reset_index()
 
     daily_stats.columns = ['date', 'mean', 'std', 'min', 'max', 'is_weekend']
 
-    # 分离工作日和假期统计
+    # 分离工作日和假期
     weekday_stats = daily_stats[daily_stats['is_weekend'] == False]
     holiday_stats = daily_stats[daily_stats['is_weekend'] == True]
 
@@ -298,17 +516,16 @@ def calculate_day_type_stats(df, anomaly_dates=None):
             'mean': weekday_stats['mean'].mean(),
             'std': weekday_stats['std'].mean(),
             'range': (weekday_stats['max'] - weekday_stats['min']).mean(),
-            'count': len(weekday_stats)  # 添加样本数量
+            'count': len(weekday_stats)
         }
     if len(holiday_stats) > 0:
         stats['holiday'] = {
             'mean': holiday_stats['mean'].mean(),
             'std': holiday_stats['std'].mean(),
             'range': (holiday_stats['max'] - holiday_stats['min']).mean(),
-            'count': len(holiday_stats)  # 添加样本数量
+            'count': len(holiday_stats)
         }
 
-    # 输出数据分布情况
     print(f"  工作日样本数: {len(weekday_stats)}, 假期样本数: {len(holiday_stats)}")
     if len(weekday_stats) + len(holiday_stats) > 0:
         holiday_ratio = len(holiday_stats) / (len(weekday_stats) + len(holiday_stats))
@@ -319,31 +536,36 @@ def calculate_day_type_stats(df, anomaly_dates=None):
 
 def detect_anomaly_days(df, z_threshold=3.0, iqr_multiplier=2.0, dynamic_patterns=None):
     """
-    检测历史数据中的异常日期
-
-    检测规则:
-    1. Z-score 方法：单日均值偏离整体均值超过 z_threshold 个标准差
-    2. IQR 方法：单日统计量超过四分位数的异常范围
+    检测历史数据中的异常日期（支持多列）
 
     参数:
-        df: DataFrame，包含 'time' 和 'value' 列
-        z_threshold: Z-score 阈值（默认3.0，即99.7%置信区间外的为异常）
-        iqr_multiplier: IQR 倍数（默认2.0）
-        dynamic_patterns: 动态生成的模板 dict{'weekday': array, 'holiday': array}
+        df: DataFrame，包含 'time' 和索引列
+        z_threshold: Z-score 阈值
+        iqr_multiplier: IQR 倍数
+        dynamic_patterns: 动态生成的模板
 
     返回:
-        set: 异常日期的集合 (date 对象)
+        set: 异常日期的集合
     """
     df = df.copy()
     df['date'] = df['time'].dt.date
 
+    # 检测索引列
+    index_cols = detect_index_columns(df)
+    if len(index_cols) == 0:
+        print("未检测到索引列，跳过异常日期检测")
+        return set()
+
+    # 使用第一个索引列进行异常检测（简化处理）
+    value_col = index_cols[0]
+
     # 按日期聚合统计
     daily_stats = df.groupby('date').agg({
-        'value': ['mean', 'std', 'min', 'max', 'count']
+        value_col: ['mean', 'std', 'min', 'max', 'count']
     }).reset_index()
     daily_stats.columns = ['date', 'mean', 'std', 'min', 'max', 'count']
 
-    # 过滤掉数据点过少的天数（至少需要有48个点，即12小时数据）
+    # 过滤掉数据点过少的天数
     daily_stats = daily_stats[daily_stats['count'] >= 48]
 
     if len(daily_stats) < 7:
@@ -352,17 +574,16 @@ def detect_anomaly_days(df, z_threshold=3.0, iqr_multiplier=2.0, dynamic_pattern
 
     anomaly_dates = set()
 
-    # 方法1: Z-score 检测
+    # Z-score 检测
     for col in ['mean', 'std', 'max']:
         col_mean = daily_stats[col].mean()
         col_std = daily_stats[col].std()
         if col_std > 0:
             z_scores = np.abs((daily_stats[col] - col_mean) / col_std)
             anomaly_mask = z_scores > z_threshold
-            anomalous = daily_stats[anomaly_mask]['date'].tolist()
-            anomaly_dates.update(anomalous)
+            anomaly_dates.update(daily_stats[anomaly_mask]['date'].tolist())
 
-    # 方法2: IQR 检测
+    # IQR 检测
     for col in ['mean', 'std', 'max']:
         q1 = daily_stats[col].quantile(0.25)
         q3 = daily_stats[col].quantile(0.75)
@@ -370,78 +591,36 @@ def detect_anomaly_days(df, z_threshold=3.0, iqr_multiplier=2.0, dynamic_pattern
         lower_bound = q1 - iqr_multiplier * iqr
         upper_bound = q3 + iqr_multiplier * iqr
         anomaly_mask = (daily_stats[col] < lower_bound) | (daily_stats[col] > upper_bound)
-        anomalous = daily_stats[anomaly_mask]['date'].tolist()
-        anomaly_dates.update(anomalous)
+        anomaly_dates.update(daily_stats[anomaly_mask]['date'].tolist())
 
-    # 方法3: 基于工作日/假期模板的相似度检测
-    daily_stats['is_weekend'] = pd.to_datetime(daily_stats['date']).dt.weekday >= 5
-
-    for _, day_row in daily_stats.iterrows():
-        date = day_row['date']
-        day_data = df[df['date'] == date]['value'].values
-
-        if len(day_data) >= 36:  # 至少需要9小时数据
-            # 必须使用动态模板
-            if dynamic_patterns is None or not isinstance(dynamic_patterns, dict):
-                print("警告: detect_anomaly_days 需要 dynamic_patterns，跳过模板相似度检测")
-                break
-
-            if day_row['is_weekend']:
-                template = dynamic_patterns.get('holiday').copy()
-            else:
-                template = dynamic_patterns.get('weekday').copy()
-
-            # 计算与模板的相似度（使用前9小时或更少）
-            observed = day_data[:min(36, len(day_data))]
-            template_segment = template[:len(observed)]
-
-            # 标准化后计算差异
-            obs_norm = (observed - np.mean(observed)) / (np.std(observed) + 1e-8)
-            temp_norm = (template_segment - np.mean(template_segment)) / (np.std(template_segment) + 1e-8)
-
-            # 计算欧氏距离
-            distance = np.sqrt(np.sum((obs_norm - temp_norm) ** 2))
-
-            # 距离过大认为是异常
-            threshold_distance = 8.0  # 经验阈值
-            if distance > threshold_distance:
-                anomaly_dates.add(date)
-
-    print(f"\n异常日期检测完成:")
-    print(f"  共检测到 {len(anomaly_dates)} 个异常日期")
-    if len(anomaly_dates) > 0:
-        sorted_anomalies = sorted(list(anomaly_dates))[:5]  # 只显示前5个
-        print(f"  前5个异常日期: {[str(d) for d in sorted_anomalies]}")
-        if len(anomaly_dates) > 5:
-            print(f"  ... 等共 {len(anomaly_dates)} 个")
+    print(f"异常日期检测完成: {len(anomaly_dates)} 个异常日期")
 
     return anomaly_dates
 
 
 def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False, mode='predict', dynamic_patterns=None, history_df=None):
     """
-    根据前9小时数据特征判断日期类型
-
-    判断依据：
-    1. 异常检测：首先检查是否为异常日期（仅在evaluate模式下）
-    2. 平均值：工作日通常有更高的平均活动量
-    3. 方差：工作日通常有更大的波动（早晚高峰）
-    4. 趋势：工作日早上通常有上升趋势
-    5. 历史统计对比（如果有）
+    根据前9小时数据特征判断日期类型（支持多列）
 
     参数:
         first_9_hours_data: 前9小时的数据
         historical_stats: 历史统计数据
         is_anomaly: 是否已标记为异常日期
-        mode: 'predict' - 预测模式（只返回weekday/holiday）
-              'evaluate' - 评估模式（返回weekday/holiday/anomaly）
-        dynamic_patterns: 动态生成的模板 dict{'weekday': array, 'holiday': array}，优先于默认模板
-        history_df: 用于动态计算阈值的历史数据DataFrame（可选）
+        mode: 'predict' - 预测模式
+              'evaluate' - 评估模式
+        dynamic_patterns: 动态生成的模板
+        history_df: 历史数据DataFrame
 
     返回:
-        'weekday', 'holiday' 或 'anomaly'（仅evaluate模式）
+        'weekday', 'holiday' 或 'anomaly'
     """
-    values = first_9_hours_data['value'].values
+    # 检测索引列，使用第一个
+    index_cols = detect_index_columns(first_9_hours_data)
+    if len(index_cols) == 0:
+        raise ValueError("未检测到索引列")
+
+    value_col = index_cols[0]
+    values = first_9_hours_data[value_col].values
 
     # 计算统计特征
     mean_value = np.mean(values)
@@ -457,19 +636,17 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
     trend = second_half_mean - first_half_mean
 
     print(f"\n前9小时数据特征:")
-    print(f"  平均值: {mean_value:.2f}")
-    print(f"  标准差: {std_value:.2f}")
-    print(f"  最小值: {min_value:.2f}")
-    print(f"  最大值: {max_value:.2f}")
-    print(f"  极差: {range_value:.2f}")
+    print(f"  {value_col} - 平均值: {mean_value:.2f}, 标准差: {std_value:.2f}")
+    print(f"  最小值: {min_value:.2f}, 最大值: {max_value:.2f}, 极差: {range_value:.2f}")
     print(f"  趋势(后半-前半): {trend:.2f}")
 
-    # 计算与模板的相似度（必须使用动态模板）
-    if dynamic_patterns is None or not isinstance(dynamic_patterns, dict):
-        raise ValueError("detect_day_type requires dynamic_patterns parameter from generate_pattern_from_history()")
+    # 获取该列的模板
+    col_patterns = dynamic_patterns.get(value_col, dynamic_patterns.get('weekday', {}))
+    if not col_patterns:
+        raise ValueError(f"dynamic_patterns 中未找到列 {value_col} 的模板")
 
-    weekday_template = dynamic_patterns.get('weekday')[:len(values)]
-    holiday_template = dynamic_patterns.get('holiday')[:len(values)]
+    weekday_template = col_patterns.get('weekday', [])[:len(values)]
+    holiday_template = col_patterns.get('holiday', [])[:len(values)]
 
     weekday_similarity = calculate_pattern_similarity(values, weekday_template)
     holiday_similarity = calculate_pattern_similarity(values, holiday_template)
@@ -494,9 +671,9 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
 
         if len(first_9_hours_history) > 0:
             # 动态趋势阈值：使用前9小时数据标准差的10%
-            threshold_trend = first_9_hours_history['value'].std() * 0.1
+            threshold_trend = first_9_hours_history[value_col].std() * 0.1
             # 动态极差阈值：基于前9小时的极差统计
-            range_values = first_9_hours_history.groupby(first_9_hours_history['time'].dt.date)['value'].apply(lambda x: x.max() - x.min())
+            range_values = first_9_hours_history.groupby(first_9_hours_history['time'].dt.date)[value_col].apply(lambda x: x.max() - x.min())
             if len(range_values) > 0:
                 threshold_range_min = max(5, range_values.quantile(0.05))  # 5%分位数
                 threshold_range_max = min(300, range_values.quantile(0.95))  # 95%分位数
@@ -640,7 +817,7 @@ def calculate_pattern_similarity(observed, template):
 
 def predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stats=None, interval_minutes=15, remaining_times=None, dynamic_patterns=None):
     """
-    根据日期类型预测当天剩余时间
+    根据日期类型预测当天剩余时间（支持多列）
 
     参数:
         df: 历史数据
@@ -650,35 +827,40 @@ def predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stat
         historical_stats: 历史统计特征（用于异常日期预测）
         interval_minutes: 时间间隔分钟数（15或60）
         remaining_times: 预测时间点列表（可选）
-        dynamic_patterns: 动态生成的模板 dict{'weekday': array, 'holiday': array}，优先于默认模板
+        dynamic_patterns: 动态生成的模板 dict{col: {'weekday': array, 'holiday': array}}
 
     返回:
-        预测结果DataFrame
+        预测结果DataFrame，包含 'time' 和各索引列的预测值
     """
     # 获取配置
     config = get_interval_config(interval_minutes)
 
+    # 检测索引列
+    index_cols = detect_index_columns(df)
+
     print(f"\n开始预测当天剩余时间（基于{day_type}模式，{interval_minutes}分钟间隔）...")
+    print(f"索引列: {index_cols}")
 
     # 处理0点预测情况（first_9_hours为空）
     if len(first_9_hours) == 0:
         # 0点预测：使用历史数据计算最后一个值作为参考
         if len(df) > 0:
-            # 获取历史最后一天最后几个点的平均值
             last_day = df['time'].max().date()
             last_day_data = df[df['time'].dt.date == last_day]
-            if len(last_day_data) > 0:
-                last_value = last_day_data['value'].iloc[-1]
-            else:
-                last_value = df['value'].iloc[-1]
+            # 为每个索引列获取最后的值
+            last_values = {}
+            for col in index_cols:
+                if len(last_day_data) > 0:
+                    last_values[col] = last_day_data[col].iloc[-1]
+                else:
+                    last_values[col] = df[col].iloc[-1]
         else:
-            last_value = 100  # 默认值
+            last_values = {col: 100 for col in index_cols}
 
-        # 目标日期 - 使用day_data获取（如果有）
+        # 目标日期
         if len(day_data) > 0:
             target_date = day_data['time'].min().date()
         else:
-            # 使用历史数据的最后日期+1天
             target_date = df['time'].max().date() + timedelta(days=1)
         last_time = pd.Timestamp(target_date)
 
@@ -686,14 +868,13 @@ def predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stat
     else:
         # 获取前9小时的最后一个时间点
         last_time = first_9_hours['time'].iloc[-1]
-        last_value = first_9_hours['value'].iloc[-1]
+        last_values = {col: first_9_hours[col].iloc[-1] for col in index_cols}
 
     # 确定当天剩余时间
     current_date = last_time.date()
     day_end = pd.Timestamp(current_date) + timedelta(days=1)
 
-    # 生成剩余时间的预测时间点（根据时间间隔）
-    # 优先使用传入的remaining_times参数
+    # 生成剩余时间的预测时间点
     if remaining_times is None or len(remaining_times) == 0:
         remaining_times = pd.date_range(
             start=last_time + timedelta(minutes=interval_minutes),
@@ -706,7 +887,6 @@ def predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stat
     print(f"预测时间范围: {remaining_times[0]} 至 {remaining_times[-1]}")
 
     # 将数值day_type转换为字符串类型
-    # 1=工作日(weekday), 0=休息日(holiday), 其他=异常(anomaly)
     if isinstance(day_type, (int, float)):
         if day_type == 1:
             day_type_str = 'weekday'
@@ -718,95 +898,112 @@ def predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stat
     else:
         day_type_str = day_type
 
-    # 根据日期类型选择模板
+    # 为每个索引列分别进行预测
+    result_data = {'time': remaining_times}
+
+    for col in index_cols:
+        print(f"\n预测列: {col}")
+
+        # 获取该列的数据
+        col_first_9_hours = first_9_hours[[col]] if len(first_9_hours) > 0 else pd.DataFrame()
+        col_df = df[['time', col]] if col in df.columns else pd.DataFrame()
+
+        predictions = _predict_single_column(
+            col_df, col_first_9_hours, day_type_str, last_values.get(col, 100),
+            historical_stats, interval_minutes, num_predictions,
+            dynamic_patterns[col] if dynamic_patterns and col in dynamic_patterns else None,
+            remaining_times
+        )
+
+        result_data[col] = predictions
+
+    # 创建结果DataFrame
+    forecast_df = pd.DataFrame(result_data)
+
+    return forecast_df
+
+
+def _predict_single_column(df, first_9_hours, day_type_str, last_value, historical_stats, interval_minutes, num_predictions, pattern_dict, remaining_times):
+    """为单个索引列进行预测"""
+    config = get_interval_config(interval_minutes)
+
     if day_type_str == 'anomaly':
-        # 异常日期：使用更保守的预测策略
-        # 基于前N小时的趋势进行简单线性外推
-        print("异常日期模式：使用趋势外推预测")
+        # 异常日期：使用趋势外推
+        if len(first_9_hours) > 0:
+            values = first_9_hours.values.flatten()
+            trend_per_point = (values[-1] - values[0]) / len(values) if len(values) > 1 else 0
+        else:
+            trend_per_point = 0
 
-        # 计算前N小时的平均趋势（每点的变化）
-        values = first_9_hours['value'].values
-        trend_per_point = (values[-1] - values[0]) / len(values) if len(values) > 1 else 0
-
-        # 基于最后一个值和趋势进行预测
         predictions = []
         current_val = last_value
         for i in range(num_predictions):
             current_val += trend_per_point
-            # 添加一些衰减，避免趋势无限延续
-            if day_type == 'anomaly':
-                # 异常日期预测值趋向历史均值
-                if 'weekday' in historical_stats:
-                    historical_mean = historical_stats['weekday']['mean']
-                elif 'holiday' in historical_stats:
-                    historical_mean = historical_stats['holiday']['mean']
-                else:
-                    historical_mean = last_value
-                # 逐渐回归历史均值
-                decay_factor = 0.02
-                current_val = current_val * (1 - decay_factor) + historical_mean * decay_factor
+            # 趋向历史均值
+            if historical_stats and 'weekday' in historical_stats:
+                historical_mean = historical_stats['weekday']['mean']
+            elif historical_stats and 'holiday' in historical_stats:
+                historical_mean = historical_stats['holiday']['mean']
+            else:
+                historical_mean = last_value
+            decay_factor = 0.02
+            current_val = current_val * (1 - decay_factor) + historical_mean * decay_factor
             predictions.append(max(0, current_val))
 
-        predictions = np.array(predictions)
-
-        # 异常日期的置信区间更宽（不确定性更高）
-        lower_factor = 0.70  # 30%下限
-        upper_factor = 1.30  # 30%上限
+        return np.array(predictions)
 
     else:
-        # 正常日期：使用动态生成的模板
-        if dynamic_patterns is None or not isinstance(dynamic_patterns, dict):
-            raise ValueError("predict_remaining_day requires dynamic_patterns parameter from generate_pattern_from_history()")
+        # 正常日期：使用模板匹配
+        if pattern_dict is None:
+            raise ValueError(f"需要为该列提供 dynamic_patterns 参数")
 
         if day_type_str == 'weekday':
-            base_pattern = dynamic_patterns['weekday'].copy()
+            base_pattern = pattern_dict['weekday'].copy()
         else:
-            base_pattern = dynamic_patterns['holiday'].copy()
-        print(f"使用动态生成的模板（{day_type_str}）")
+            base_pattern = pattern_dict['holiday'].copy()
 
-        # 根据前9小时数据调整模板幅度（如果有当天数据）
         if len(first_9_hours) > 0:
-            observed_mean = first_9_hours['value'].mean()
+            observed_mean = first_9_hours.values.mean()
             template_mean = base_pattern[:len(first_9_hours)].mean()
             scale_factor = observed_mean / (template_mean + 1e-8)
 
-            # 根据前9小时最后一个值调整偏移
             template_end_value = base_pattern[len(first_9_hours) - 1]
             offset = last_value - template_end_value * scale_factor
 
-            print(f"模板调整参数 - 缩放因子: {scale_factor:.2f}, 偏移量: {offset:.2f}")
-
-            # 提取剩余时间的模板值
             start_idx = len(first_9_hours)
             remaining_template = base_pattern[start_idx:start_idx + num_predictions]
-
-            # 应用调整
             predictions = remaining_template * scale_factor + offset
         else:
-            # 0点预测：使用完整的模板
-            scale_factor = 1.0
-            offset = 0
+            # 0点预测：使用完整模板
             remaining_template = base_pattern[:num_predictions]
             predictions = remaining_template.copy()
-            print("0点预测模式：使用完整模板，不做调整")
 
-        # 正常日期的置信区间
-        lower_factor = 0.85
-        upper_factor = 1.15
+        # 趋势调整：使用趋势因子直接作用于模板
+        # 新逻辑：模板值 × 趋势因子，而不是累加
+        if pattern_dict and 'trend' in pattern_dict:
+            trend_info = pattern_dict['trend']
+            if isinstance(trend_info, dict) and 'trend_factors' in trend_info:
+                trend_factors = trend_info['trend_factors']
+                if len(trend_factors) > 0:
+                    applied_count = 0
 
-    # 确保预测值非负
-    predictions = np.maximum(predictions, 0)
+                    for i in range(num_predictions):
+                        pred_time = remaining_times[i]
+                        time_str = pred_time.strftime('%H:%M')
 
-    # 创建结果DataFrame
-    forecast_df = pd.DataFrame({
-        'time': remaining_times,
-        'value_predicted': predictions,
-        'day_type': [day_type] * len(remaining_times),
-        'value_lower': predictions * lower_factor,
-        'value_upper': predictions * upper_factor
-    })
+                        # 查找该时间点的趋势因子
+                        if time_str in trend_factors:
+                            factor = trend_factors[time_str]
+                            # 趋势因子直接乘以预测值
+                            # factor > 1 表示上涨，factor < 1 表示下跌
+                            predictions[i] = predictions[i] * factor
+                            applied_count += 1
 
-    return forecast_df
+                    if applied_count > 0:
+                        overall = trend_info.get('overall_trend', 1.0)
+                        print(f"  [趋势调整] 整体因子={overall:.3f}, 应用于{applied_count}个时间点")
+
+    return np.maximum(predictions, 0)
 
 
 class TimeSeriesDataProcessor:
@@ -1184,7 +1381,7 @@ def predict_daily_remaining(input_df, target_date=None, max_history_days=None,
 
     # 根据时间间隔自动设置窗口大小（如果未指定）
     if max_history_days is None:
-        max_history_days = config['train_window_days']
+        max_history_days = config['stats_window_days']
     stats_window_days = config['stats_window_days']
 
     print(f"\n配置信息:")
@@ -1323,7 +1520,7 @@ def predict_at_midnight(input_df, interval_minutes=15, calendar_day_type_input=0
 
     返回:
         预测结果DataFrame，包含当日0-24时的预测值
-        - 包含 'time', 'value_predicted', 'day_type', 'value_lower', 'value_upper' 列
+        - 包含 'time', 'value_predicted', 'day_type' 列
     """
     print("=" * 60)
     print("0点预测 - 基于手动输入的日期类型")
@@ -1347,7 +1544,7 @@ def predict_at_midnight(input_df, interval_minutes=15, calendar_day_type_input=0
     # 处理max_history_days参数
     # None: 使用默认值, 0: 使用全部数据, 正整数: 使用指定天数
     if max_history_days is None:
-        use_max_days = config['train_window_days']
+        use_max_days = config['stats_window_days']
     elif max_history_days == 0:
         # 计算实际可用天数
         date_range = (input_df['time'].max() - input_df['time'].min()).days
@@ -1432,7 +1629,7 @@ def predict_at_nine(input_df, first_9_hours_df, interval_minutes=15, max_history
 
     # 处理max_history_days参数
     if max_history_days is None:
-        use_max_days = config['train_window_days']
+        use_max_days = config['stats_window_days']
     elif max_history_days == 0:
         date_range = (input_df['time'].max() - input_df['time'].min()).days
         use_max_days = date_range
@@ -1682,7 +1879,7 @@ def preprocess_for_prediction(input_df, interval_minutes=15, max_history_days=No
     config = get_interval_config(interval_minutes)
 
     if max_history_days is None:
-        max_history_days = config['train_window_days']
+        max_history_days = config['stats_window_days']
     stats_window_days = config['stats_window_days']
 
     # 加载并预处理数据
@@ -1863,20 +2060,25 @@ def batch_evaluate_days(df, historical_stats=None, anomaly_dates=None, interval_
     return results
 
 
-def generate_sample_data(days=800, pattern_type='mixed', interval_minutes=15):
+def generate_sample_data(days=800, pattern_type='mixed', interval_minutes=15, num_indices=1):
     """
     生成示例数据用于测试 - 支持生成2年以上数据
 
     参数:
         days: 生成天数（默认800天≈2.2年）
         pattern_type: 'weekday', 'weekend', 'mixed'
-        interval_minutes: 时间间隔分钟数（15或60）
+        interval_minutes: 时间间隔分钟数（5、15或60）
+        num_indices: 索引列数量（默认1，支持多列）
     """
     np.random.seed(42)
 
     # 根据时间间隔确定频率
-    freq = '15min' if interval_minutes == 15 else '60min'
-    points_per_hour = 4 if interval_minutes == 15 else 1
+    if interval_minutes == 5:
+        freq = '5min'
+    elif interval_minutes == 15:
+        freq = '15min'
+    else:
+        freq = '60min'
 
     # 生成时间序列
     end_time = datetime.now().replace(hour=18, minute=0, second=0, microsecond=0)
@@ -1884,89 +2086,113 @@ def generate_sample_data(days=800, pattern_type='mixed', interval_minutes=15):
 
     time_range = pd.date_range(start=start_time, end=end_time, freq=freq)
 
-    values = []
-    day_types = []
+    # 生成多个索引列
+    data = {'time': time_range, 'day_type': []}
+    for i in range(1, num_indices + 1):
+        data[f'Index_{i}'] = []
+
     for t in time_range:
         hour = t.hour
         is_weekend = t.weekday() >= 5
 
         # 设置day_type: 1=工作日, 0=休息日
         day_type = 0 if is_weekend else 1
+        data['day_type'].append(day_type)
 
         # 季节性因子（年周期）
         day_of_year = t.timetuple().tm_yday
         seasonal_factor = 1 + 0.1 * np.sin(2 * np.pi * day_of_year / 365)
 
-        if is_weekend:
-            # 假期模式：较低的活动量，平缓
-            base = (50 + 30 * np.sin(2 * np.pi * (hour - 6) / 18)) * seasonal_factor if 6 <= hour <= 24 else 40 * seasonal_factor
-            noise = np.random.normal(0, 5)
-        else:
-            # 工作日模式：早晚高峰
-            if 7 <= hour <= 9:  # 早高峰
-                base = (150 + 50 * np.sin(2 * np.pi * (hour - 7) / 3)) * seasonal_factor
-            elif 17 <= hour <= 19:  # 晚高峰
-                base = (160 + 40 * np.sin(2 * np.pi * (hour - 17) / 3)) * seasonal_factor
-            elif 9 <= hour <= 17:  # 工作时间
-                base = (130 + 20 * np.sin(2 * np.pi * hour / 24)) * seasonal_factor
-            else:  # 夜间
-                base = (40 + 10 * np.sin(2 * np.pi * hour / 24)) * seasonal_factor
-            noise = np.random.normal(0, 8)
+        # 为每个索引列生成数据
+        for i in range(1, num_indices + 1):
+            if is_weekend:
+                # 假期模式
+                base = (50 + 30 * np.sin(2 * np.pi * (hour - 6) / 18)) * seasonal_factor if 6 <= hour <= 24 else 40 * seasonal_factor
+                noise = np.random.normal(0, 5)
+            else:
+                # 工作日模式
+                if 7 <= hour <= 9:
+                    base = (150 + 50 * np.sin(2 * np.pi * (hour - 7) / 3)) * seasonal_factor
+                elif 17 <= hour <= 19:
+                    base = (160 + 40 * np.sin(2 * np.pi * (hour - 17) / 3)) * seasonal_factor
+                elif 9 <= hour <= 17:
+                    base = (130 + 20 * np.sin(2 * np.pi * hour / 24)) * seasonal_factor
+                else:
+                    base = (40 + 10 * np.sin(2 * np.pi * hour / 24)) * seasonal_factor
+                noise = np.random.normal(0, 8)
 
-        values.append(max(0, base + noise))
-        day_types.append(day_type)
+            # 添加列间的差异
+            base = base * (1 + 0.2 * (i - 1))  # 每个索引有不同的基准
 
-    df = pd.DataFrame({
-        'time': time_range,
-        'value': values,
-        'day_type': day_types
-    })
+            data[f'Index_{i}'].append(max(0, base + noise))
 
+    df = pd.DataFrame(data)
     return df
 
 
 if __name__ == '__main__':
     import time
 
-    # 记录开始时间
-    start_time = time.time()
-
-    # 生成示例数据（模拟2年历史数据）
-    print("\n生成示例数据（模拟2年历史数据，约70000+数据点）...")
-    sample_df = generate_sample_data(days=800, pattern_type='mixed')
-    print(f"示例数据形状: {sample_df.shape}")
-    print(f"数据时间跨度: {sample_df['time'].min().date()} 至 {sample_df['time'].max().date()}")
-
-    # 执行预测
-    try:
-        # 使用默认参数（自动截取最近90天）
-        value_predict_df = predict_daily_remaining(sample_df)
-
-        # 显示结果
-        print("\n" + "=" * 60)
-        print("预测结果：")
-        print("=" * 60)
-        print(value_predict_df.head(10))
-        print("...")
-        print(value_predict_df.tail(10))
-
-        print("\n" + "=" * 60)
-        print(f"预测结果统计：")
-        print("=" * 60)
-        print(value_predict_df['value_predicted'].describe())
-
-        # 保存结果（可选）
-        # value_predict_df.to_csv('forecast_result.csv', index=False)
-        # print("\n结果已保存到 forecast_result.csv")
-
-    except Exception as e:
-        print(f"预测失败: {e}")
-        import traceback
-        traceback.print_exc()
-
-    # 记录结束时间
-    end_time = time.time()
-    elapsed_time = end_time - start_time
+    # 生成模拟2年数据（3个索引列）
     print("\n" + "=" * 60)
-    print(f"总运行时间: {elapsed_time:.2f} 秒 ({elapsed_time/60:.2f} 分钟)")
+    print("生成模拟2年历史数据（3个索引列）")
+    print("=" * 60)
+    data_gen_start = time.time()
+    sample_df = generate_sample_data(days=800, pattern_type='mixed', num_indices=3)
+    data_gen_time = time.time() - data_gen_start
+    print(f"数据形状: {sample_df.shape}")
+    print(f"数据列: {list(sample_df.columns)}")
+    print(f"数据生成耗时: {data_gen_time:.2f} 秒")
+
+    # 获取测试日期
+    last_date = sample_df['time'].max().date()
+    today_start = datetime.combine(last_date, datetime.min.time())
+
+    # ========== 测试 predict_at_midnight ==========
+    print("\n" + "=" * 60)
+    print("测试 predict_at_midnight (0点预测)")
+    print("=" * 60)
+    midnight_start = time.time()
+    midnight_result = predict_at_midnight(
+        sample_df,
+        interval_minutes=15,
+        calendar_day_type_input=1  # 预设工作日
+    )
+    midnight_time = time.time() - midnight_start
+    print(f"\n运行时间: {midnight_time:.2f} 秒")
+    print(f"预测结果: {len(midnight_result)}行, 列: {list(midnight_result.columns)}")
+    index_cols = [c for c in midnight_result.columns if c != 'time']
+    for col in index_cols:
+        print(f"  {col}: {midnight_result[col].min():.1f} - {midnight_result[col].max():.1f}")
+
+    # ========== 测试 predict_at_nine ==========
+    print("\n" + "=" * 60)
+    print("测试 predict_at_nine (9点预测)")
+    print("=" * 60)
+    first_9_hours_end = today_start + timedelta(hours=9)
+    first_9_hours_df = sample_df[
+        (sample_df['time'] >= today_start) &
+        (sample_df['time'] < first_9_hours_end)
+    ].copy()
+
+    nine_start = time.time()
+    nine_result = predict_at_nine(sample_df, first_9_hours_df, interval_minutes=15)
+    nine_time = time.time() - nine_start
+
+    day_type_val, forecast_df = nine_result
+    day_type_map = {1: '工作日', 0: '休息日', 2: '异常'}
+    print(f"\n运行时间: {nine_time:.2f} 秒")
+    print(f"推断日期类型: {day_type_val} ({day_type_map.get(day_type_val, '未知')})")
+    print(f"预测结果: {len(forecast_df)}行, 列: {list(forecast_df.columns)}")
+
+    # ========== 运行时间汇总 ==========
+    print("\n" + "=" * 60)
+    print("运行时间汇总 (2年数据/800天/76801点, 3个索引列)")
+    print("=" * 60)
+    print(f"数据生成:       {data_gen_time:>8.2f} 秒")
+    print(f"predict_at_midnight: {midnight_time:>8.2f} 秒")
+    print(f"predict_at_nine:     {nine_time:>8.2f} 秒")
+    print("-" * 40)
+    total = data_gen_time + midnight_time + nine_time
+    print(f"总计:           {total:>8.2f} 秒 ({total/60:.2f} 分钟)")
     print("=" * 60)
