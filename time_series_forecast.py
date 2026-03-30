@@ -828,12 +828,17 @@ def _detect_day_type_single_column(first_9_hours_data, value_col, historical_sta
         print(f"  -> 有明显下降趋势({trend:.2f} < {-threshold_trend:.2f})，倾向假期")
 
     # 规则4: 模板相似度
-    if weekday_similarity > holiday_similarity:
+    # 相同时（或差距<0.01）默认判断为工作日
+    if weekday_similarity > holiday_similarity + 0.01:
         weekday_score += 2
         print("  -> 与工作日模板更相似")
-    else:
+    elif holiday_similarity > weekday_similarity + 0.01:
         holiday_score += 2
         print("  -> 与假期模板更相似")
+    else:
+        # 相似度相近时，默认工作日
+        weekday_score += 2
+        print(f"  -> 相似度相近({weekday_similarity:.4f} vs {holiday_similarity:.4f})，默认工作日")
 
     # 最终判断
     if weekday_score >= holiday_score:
