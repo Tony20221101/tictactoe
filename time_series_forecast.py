@@ -649,23 +649,22 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
 
     print(f"\n投票统计: 工作日={weekday_count}, 假期={holiday_count}, 异常={anomaly_count}")
 
-    # 多数投票
-    if weekday_count > holiday_count and weekday_count > anomaly_count:
-        day_type = 'weekday'
-    elif holiday_count > weekday_count and holiday_count > anomaly_count:
+    # 新逻辑：当假期Index数量超过1/4时，使用假期模板；否则使用工作日模板
+    # 计算是否为假期的阈值（超过1/4的Index判断为假期时，整体为假期）
+    holiday_threshold = total / 4  # 超过1/4即判定为假期
+
+    if holiday_count > holiday_threshold:
         day_type = 'holiday'
-    elif anomaly_count > weekday_count and anomaly_count > holiday_count:
-        day_type = 'anomaly'
     else:
-        # 平票时，使用第一个有效列的结果
-        first_result = next(iter(col_results.values()))
-        day_type = first_result['day_type']
+        day_type = 'weekday'
 
     # 计算置信度
-    max_votes = max(weekday_count, holiday_count, anomaly_count)
+    max_votes = max(weekday_count, holiday_count)
     confidence = max_votes / total if total > 0 else 0
 
     print(f"\n最终判断结果: {day_type.upper()} (置信度: {confidence:.2%})")
+    if day_type == 'holiday':
+        print(f"  (假期Index数量 {holiday_count} > 阈值 {holiday_threshold:.1f})")
 
     return day_type
 
