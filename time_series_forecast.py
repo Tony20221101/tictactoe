@@ -600,7 +600,10 @@ def detect_anomaly_days(df, z_threshold=3.0, iqr_multiplier=2.0, dynamic_pattern
 
 def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False, mode='predict', dynamic_patterns=None, history_df=None):
     """
-    根据前9小时数据特征判断日期类型（支持多列）
+    根据前9小时数据特征判断日期类型（支持多列，采用多数投票）
+
+    对每个索引列分别进行模板匹配，判断其日期类型，
+    然后使用多数投票决定最终的日期类型。
 
     参数:
         first_9_hours_data: 前9小时的数据
@@ -614,12 +617,63 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
     返回:
         'weekday', 'holiday' 或 'anomaly'
     """
-    # 检测索引列，使用第一个
+    # 检测索引列
     index_cols = detect_index_columns(first_9_hours_data)
     if len(index_cols) == 0:
         raise ValueError("未检测到索引列")
 
-    value_col = index_cols[0]
+    print(f"\n前9小时数据特征（{len(index_cols)}个索引列）:")
+
+    # 存储每个列的判断结果
+    col_results = {}
+
+    # 对每个索引列分别进行日期类型判断
+    for value_col in index_cols:
+        col_result = _detect_day_type_single_column(
+            first_9_hours_data, value_col, historical_stats,
+            is_anomaly, mode, dynamic_patterns, history_df
+        )
+        col_results[value_col] = col_result
+
+    # 多数投票决定最终日期类型
+    weekday_count = sum(1 for r in col_results.values() if r['day_type'] == 'weekday')
+    holiday_count = sum(1 for r in col_results.values() if r['day_type'] == 'holiday')
+    anomaly_count = sum(1 for r in col_results.values() if r['day_type'] == 'anomaly')
+
+    total = weekday_count + holiday_count + anomaly_count
+
+    # 打印各列结果
+    print(f"\n各索引列日期类型判断结果:")
+    for col, result in col_results.items():
+        print(f"  {col}: {result['day_type']} (工作日相似度: {result.get('weekday_similarity', 0):.4f}, 假期相似度: {result.get('holiday_similarity', 0):.4f})")
+
+    print(f"\n投票统计: 工作日={weekday_count}, 假期={holiday_count}, 异常={anomaly_count}")
+
+    # 多数投票
+    if weekday_count > holiday_count and weekday_count > anomaly_count:
+        day_type = 'weekday'
+    elif holiday_count > weekday_count and holiday_count > anomaly_count:
+        day_type = 'holiday'
+    elif anomaly_count > weekday_count and anomaly_count > holiday_count:
+        day_type = 'anomaly'
+    else:
+        # 平票时，使用第一个有效列的结果
+        first_result = next(iter(col_results.values()))
+        day_type = first_result['day_type']
+
+    # 计算置信度
+    max_votes = max(weekday_count, holiday_count, anomaly_count)
+    confidence = max_votes / total if total > 0 else 0
+
+    print(f"\n最终判断结果: {day_type.upper()} (置信度: {confidence:.2%})")
+
+    return day_type
+
+
+def _detect_day_type_single_column(first_9_hours_data, value_col, historical_stats, is_anomaly, mode, dynamic_patterns, history_df):
+    """
+    对单个索引列进行日期类型判断（供 detect_day_type 调用）
+    """
     values = first_9_hours_data[value_col].values
 
     # 计算统计特征
@@ -635,10 +689,7 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
     second_half_mean = np.mean(values[mid:])
     trend = second_half_mean - first_half_mean
 
-    print(f"\n前9小时数据特征:")
-    print(f"  {value_col} - 平均值: {mean_value:.2f}, 标准差: {std_value:.2f}")
-    print(f"  最小值: {min_value:.2f}, 最大值: {max_value:.2f}, 极差: {range_value:.2f}")
-    print(f"  趋势(后半-前半): {trend:.2f}")
+    print(f"  {value_col} - 平均值: {mean_value:.2f}, 标准差: {std_value:.2f}, 极差: {range_value:.2f}, 趋势: {trend:.2f}")
 
     # 获取该列的模板
     col_patterns = dynamic_patterns.get(value_col, dynamic_patterns.get('weekday', {}))
@@ -651,8 +702,8 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
     weekday_similarity = calculate_pattern_similarity(values, weekday_template)
     holiday_similarity = calculate_pattern_similarity(values, holiday_template)
 
-    print(f"  与工作日模板相似度: {weekday_similarity:.4f}")
-    print(f"  与假期模板相似度: {holiday_similarity:.4f}")
+    print(f"    与工作日模板相似度: {weekday_similarity:.4f}")
+    print(f"    与假期模板相似度: {holiday_similarity:.4f}")
 
     # ===== 动态计算阈值 =====
     threshold_similarity = 0.3  # 默认相似度阈值
@@ -678,10 +729,10 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
                 threshold_range_min = max(5, range_values.quantile(0.05))  # 5%分位数
                 threshold_range_max = min(300, range_values.quantile(0.95))  # 95%分位数
             # 动态相似度阈值：使用历史相似度的20%分位数
-            if 'weekday' in dynamic_patterns and 'holiday' in dynamic_patterns:
+            if col_patterns and 'weekday' in col_patterns and 'holiday' in col_patterns:
                 # 计算模板自身的对比作为基准
-                wd_temp = dynamic_patterns['weekday'][:len(values)]
-                hl_temp = dynamic_patterns['holiday'][:len(values)]
+                wd_temp = col_patterns['weekday'][:len(values)]
+                hl_temp = col_patterns['holiday'][:len(values)]
                 self_similarity = calculate_pattern_similarity(wd_temp, hl_temp)
                 threshold_similarity = max(0.2, self_similarity * 0.5)
 
@@ -792,10 +843,17 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
         day_type = 'holiday'
         confidence = holiday_score / (weekday_score + holiday_score) if (weekday_score + holiday_score) > 0 else 0.5
 
-    print(f"\n判断结果: {day_type.upper()} (置信度: {confidence:.2%})")
-    print(f"评分 - 工作日: {weekday_score}, 假期: {holiday_score}")
+    print(f"\n  -> {day_type.upper()} (置信度: {confidence:.2%}), 评分 - 工作日: {weekday_score}, 假期: {holiday_score}")
 
-    return day_type
+    # 返回结果字典（供多数投票使用）
+    return {
+        'day_type': day_type,
+        'weekday_score': weekday_score,
+        'holiday_score': holiday_score,
+        'weekday_similarity': weekday_similarity,
+        'holiday_similarity': holiday_similarity,
+        'confidence': confidence
+    }
 
 
 def calculate_pattern_similarity(observed, template):
@@ -986,18 +1044,26 @@ def _predict_single_column(df, first_9_hours, day_type_str, last_value, historic
                 trend_factors = trend_info['trend_factors']
                 if len(trend_factors) > 0:
                     applied_count = 0
+                    # 确保不越界
+                    max_i = min(num_predictions, len(remaining_times) if remaining_times is not None else num_predictions)
 
-                    for i in range(num_predictions):
-                        pred_time = remaining_times[i]
-                        time_str = pred_time.strftime('%H:%M')
+                    for i in range(max_i):
+                        if remaining_times is not None:
+                            pred_time = remaining_times[i]
+                            time_str = pred_time.strftime('%H:%M')
+                        else:
+                            time_str = None
 
                         # 查找该时间点的趋势因子
-                        if time_str in trend_factors:
+                        if time_str and time_str in trend_factors:
                             factor = trend_factors[time_str]
                             # 趋势因子直接乘以预测值
                             # factor > 1 表示上涨，factor < 1 表示下跌
                             predictions[i] = predictions[i] * factor
                             applied_count += 1
+                        elif not time_str:
+                            # 如果没有remaining_times，跳过趋势调整
+                            pass
 
                     if applied_count > 0:
                         overall = trend_info.get('overall_trend', 1.0)
