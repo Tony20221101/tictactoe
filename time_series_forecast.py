@@ -795,9 +795,12 @@ def _detect_day_type_single_column(first_9_hours_data, value_col, historical_sta
     holiday_score = 0
 
     # 规则1: 平均值判断
-    threshold_mean = 80
+    threshold_mean = 80  # 默认值
     if historical_stats and 'weekday' in historical_stats and 'holiday' in historical_stats:
-        threshold_mean = (historical_stats['weekday']['mean'] + historical_stats['holiday']['mean']) / 2
+        wd_mean = historical_stats['weekday'].get('mean', 0) or 0
+        hl_mean = historical_stats['holiday'].get('mean', 0) or 0
+        if wd_mean > 0 and hl_mean > 0:
+            threshold_mean = (wd_mean + hl_mean) / 2
 
     if mean_value > threshold_mean:
         weekday_score += 1
@@ -807,9 +810,12 @@ def _detect_day_type_single_column(first_9_hours_data, value_col, historical_sta
         print(f"  -> 平均值({mean_value:.1f}) <= 阈值({threshold_mean:.1f})，倾向假期")
 
     # 规则2: 波动性判断
-    threshold_std = 30
+    threshold_std = 30  # 默认值
     if historical_stats and 'weekday' in historical_stats and 'holiday' in historical_stats:
-        threshold_std = (historical_stats['weekday']['std'] + historical_stats['holiday']['std']) / 2
+        wd_std = historical_stats['weekday'].get('std', 0) or 0
+        hl_std = historical_stats['holiday'].get('std', 0) or 0
+        if wd_std > 0 and hl_std > 0:
+            threshold_std = (wd_std + hl_std) / 2
 
     if std_value > threshold_std:
         weekday_score += 1
