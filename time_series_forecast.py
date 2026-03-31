@@ -236,8 +236,8 @@ def generate_pattern_from_history(df, interval_minutes=15, detect_trend_flag=Tru
         dict: 每列的模板字典
         {
             'Index_1': {
-                'weekday': array,  # 工作日模板
-                'holiday': array,  # 假期模板
+                1: array,  # 工作日模板
+                0: array,  # 假期模板
                 'trend': {...},    # 趋势信息 {"09:00": {...}, "10:00": {...}, ...}
                 'scope': {...}     # 数据范围信息
             },
@@ -289,8 +289,8 @@ def generate_pattern_from_history(df, interval_minutes=15, detect_trend_flag=Tru
     print(f"数据范围: {data_start_date} 至 {data_end_date}, 共{len(all_dates)}天")
     for col in index_cols:
         scope = result[col]['scope']
-        weekday_mean = np.mean(result[col]['weekday'])
-        holiday_mean = np.mean(result[col]['holiday'])
+        weekday_mean = np.mean(result[col][1])
+        holiday_mean = np.mean(result[col][0])
         print(f"  {col}:")
         print(f"    Scope: {scope['points']}点, 均值={scope['mean']:.2f}, 标准差={scope['std']:.2f}, 范围=[{scope['min']:.1f}, {scope['max']:.1f}]")
         print(f"    模板: weekday均值={weekday_mean:.2f}, holiday均值={holiday_mean:.2f}")
@@ -325,7 +325,7 @@ def _generate_single_pattern(df, interval_minutes):
     print(f"  工作日模板: {len(weekday_pattern)}点, 均值={np.mean(weekday_pattern):.2f}")
     print(f"  假期模板: {len(holiday_pattern)}点, 均值={np.mean(holiday_pattern):.2f}")
 
-    return {'weekday': weekday_pattern.values, 'holiday': holiday_pattern.values}
+    return {1: weekday_pattern.values, 0: holiday_pattern.values}
 
 
 def _generate_pattern_for_column(df, col_name, interval_minutes):
@@ -345,7 +345,7 @@ def _generate_pattern_for_column(df, col_name, interval_minutes):
     weekday_pattern = weekday_pattern.reindex(all_indices).fillna(weekday_pattern.mean())
     holiday_pattern = holiday_pattern.reindex(all_indices).fillna(holiday_pattern.mean())
 
-    return {'weekday': weekday_pattern.values, 'holiday': holiday_pattern.values}
+    return {1: weekday_pattern.values, 0: holiday_pattern.values}
 
 
 def load_and_preprocess_data(df, max_history_days=90, interval_minutes=None):
@@ -512,14 +512,14 @@ def calculate_day_type_stats(df, anomaly_dates=None):
 
     stats = {}
     if len(weekday_stats) > 0:
-        stats['weekday'] = {
+        stats[1] = {  # 1 = 工作日
             'mean': weekday_stats['mean'].mean(),
             'std': weekday_stats['std'].mean(),
             'range': (weekday_stats['max'] - weekday_stats['min']).mean(),
             'count': len(weekday_stats)
         }
     if len(holiday_stats) > 0:
-        stats['holiday'] = {
+        stats[0] = {  # 0 = 假期
             'mean': holiday_stats['mean'].mean(),
             'std': holiday_stats['std'].mean(),
             'range': (holiday_stats['max'] - holiday_stats['min']).mean(),
@@ -615,7 +615,7 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
         history_df: 历史数据DataFrame
 
     返回:
-        'weekday', 'holiday' 或 'anomaly'
+        1, 0 或 'anomaly'
     """
     # 检测索引列
     index_cols = detect_index_columns(first_9_hours_data)
@@ -636,8 +636,8 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
         col_results[value_col] = col_result
 
     # 多数投票决定最终日期类型
-    weekday_count = sum(1 for r in col_results.values() if r['day_type'] == 'weekday')
-    holiday_count = sum(1 for r in col_results.values() if r['day_type'] == 'holiday')
+    weekday_count = sum(1 for r in col_results.values() if r['day_type'] == 1)
+    holiday_count = sum(1 for r in col_results.values() if r['day_type'] == 0)
     anomaly_count = sum(1 for r in col_results.values() if r['day_type'] == 'anomaly')
 
     total = weekday_count + holiday_count + anomaly_count
@@ -654,16 +654,17 @@ def detect_day_type(first_9_hours_data, historical_stats=None, is_anomaly=False,
     holiday_threshold = total / 4  # 超过1/4即判定为假期
 
     if holiday_count > holiday_threshold:
-        day_type = 'holiday'
+        day_type = 0
     else:
-        day_type = 'weekday'
+        day_type = 1
 
     # 计算置信度
     max_votes = max(weekday_count, holiday_count)
     confidence = max_votes / total if total > 0 else 0
 
-    print(f"\n最终判断结果: {day_type.upper()} (置信度: {confidence:.2%})")
-    if day_type == 'holiday':
+    day_type_display = {1: 'WORKDAY', 0: 'HOLIDAY', 'anomaly': 'ANOMALY'}
+    print(f"\n最终判断结果: {day_type_display.get(day_type, day_type)} (置信度: {confidence:.2%})")
+    if day_type == 0:
         print(f"  (假期Index数量 {holiday_count} > 阈值 {holiday_threshold:.1f})")
 
     return day_type
@@ -691,12 +692,12 @@ def _detect_day_type_single_column(first_9_hours_data, value_col, historical_sta
     print(f"  {value_col} - 平均值: {mean_value:.2f}, 标准差: {std_value:.2f}, 极差: {range_value:.2f}, 趋势: {trend:.2f}")
 
     # 获取该列的模板
-    col_patterns = dynamic_patterns.get(value_col, dynamic_patterns.get('weekday', {}))
+    col_patterns = dynamic_patterns.get(value_col, dynamic_patterns.get(1, {}))
     if not col_patterns:
         raise ValueError(f"dynamic_patterns 中未找到列 {value_col} 的模板")
 
-    weekday_template = col_patterns.get('weekday', [])[:len(values)]
-    holiday_template = col_patterns.get('holiday', [])[:len(values)]
+    weekday_template = col_patterns.get(1, [])[:len(values)]
+    holiday_template = col_patterns.get(0, [])[:len(values)]
 
     weekday_similarity = calculate_pattern_similarity(values, weekday_template)
     holiday_similarity = calculate_pattern_similarity(values, holiday_template)
@@ -728,10 +729,10 @@ def _detect_day_type_single_column(first_9_hours_data, value_col, historical_sta
                 threshold_range_min = max(5, range_values.quantile(0.05))  # 5%分位数
                 threshold_range_max = min(300, range_values.quantile(0.95))  # 95%分位数
             # 动态相似度阈值：使用历史相似度的20%分位数
-            if col_patterns and 'weekday' in col_patterns and 'holiday' in col_patterns:
+            if col_patterns and 1 in col_patterns and 0 in col_patterns:
                 # 计算模板自身的对比作为基准
-                wd_temp = col_patterns['weekday'][:len(values)]
-                hl_temp = col_patterns['holiday'][:len(values)]
+                wd_temp = col_patterns[1][:len(values)]
+                hl_temp = col_patterns[0][:len(values)]
                 self_similarity = calculate_pattern_similarity(wd_temp, hl_temp)
                 threshold_similarity = max(0.2, self_similarity * 0.5)
 
@@ -763,16 +764,16 @@ def _detect_day_type_single_column(first_9_hours_data, value_col, historical_sta
 
         if historical_stats:
             # 检查是否偏离历史统计太多
-            if 'weekday' in historical_stats:
-                wd_mean = historical_stats['weekday']['mean']
-                wd_std = historical_stats['weekday']['std']
+            if 1 in historical_stats:
+                wd_mean = historical_stats[1]['mean']
+                wd_std = historical_stats[1]['std']
                 if abs(mean_value - wd_mean) > 3 * wd_std:
                     is_anomaly_detected = True
                     anomaly_reasons.append(f"均值偏离工作日统计({abs(mean_value - wd_mean):.1f} > 3σ)")
 
-            if 'holiday' in historical_stats:
-                hl_mean = historical_stats['holiday']['mean']
-                hl_std = historical_stats['holiday']['std']
+            if 0 in historical_stats:
+                hl_mean = historical_stats[0]['mean']
+                hl_std = historical_stats[0]['std']
                 if abs(mean_value - hl_mean) > 3 * hl_std:
                     is_anomaly_detected = True
                     anomaly_reasons.append(f"均值偏离假期统计({abs(mean_value - hl_mean):.1f} > 3σ)")
@@ -796,9 +797,9 @@ def _detect_day_type_single_column(first_9_hours_data, value_col, historical_sta
 
     # 规则1: 平均值判断
     threshold_mean = 80  # 默认值
-    if historical_stats and 'weekday' in historical_stats and 'holiday' in historical_stats:
-        wd_mean = historical_stats['weekday'].get('mean', 0) or 0
-        hl_mean = historical_stats['holiday'].get('mean', 0) or 0
+    if historical_stats and 1 in historical_stats and 0 in historical_stats:
+        wd_mean = historical_stats[1].get('mean', 0) or 0
+        hl_mean = historical_stats[0].get('mean', 0) or 0
         if wd_mean > 0 and hl_mean > 0:
             threshold_mean = (wd_mean + hl_mean) / 2
 
@@ -811,9 +812,9 @@ def _detect_day_type_single_column(first_9_hours_data, value_col, historical_sta
 
     # 规则2: 波动性判断
     threshold_std = 30  # 默认值
-    if historical_stats and 'weekday' in historical_stats and 'holiday' in historical_stats:
-        wd_std = historical_stats['weekday'].get('std', 0) or 0
-        hl_std = historical_stats['holiday'].get('std', 0) or 0
+    if historical_stats and 1 in historical_stats and 0 in historical_stats:
+        wd_std = historical_stats[1].get('std', 0) or 0
+        hl_std = historical_stats[0].get('std', 0) or 0
         if wd_std > 0 and hl_std > 0:
             threshold_std = (wd_std + hl_std) / 2
 
@@ -847,13 +848,14 @@ def _detect_day_type_single_column(first_9_hours_data, value_col, historical_sta
 
     # 最终判断
     if weekday_score >= holiday_score:
-        day_type = 'weekday'
+        day_type = 1
         confidence = weekday_score / (weekday_score + holiday_score) if (weekday_score + holiday_score) > 0 else 0.5
     else:
-        day_type = 'holiday'
+        day_type = 0
         confidence = holiday_score / (weekday_score + holiday_score) if (weekday_score + holiday_score) > 0 else 0.5
 
-    print(f"\n  -> {day_type.upper()} (置信度: {confidence:.2%}), 评分 - 工作日: {weekday_score}, 假期: {holiday_score}")
+    day_type_display = {1: 'WORKDAY', 0: 'HOLIDAY'}
+    print(f"\n  -> {day_type_display.get(day_type, day_type)} (置信度: {confidence:.2%}), 评分 - 工作日: {weekday_score}, 假期: {holiday_score}")
 
     # 返回结果字典（供多数投票使用）
     return {
@@ -890,12 +892,12 @@ def predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stat
     参数:
         df: 历史数据
         first_9_hours: 前9小时数据（或根据时间间隔的前N小时数据）
-        day_type: 'weekday', 'holiday', 'anomaly' 或对应的数值(0/1/2)
+        day_type: 1, 0, 'anomaly' 或对应的数值(0/1/2)
         day_data: 当天的完整数据
         historical_stats: 历史统计特征（用于异常日期预测）
         interval_minutes: 时间间隔分钟数（15或60）
         remaining_times: 预测时间点列表（可选）
-        dynamic_patterns: 动态生成的模板 dict{col: {'weekday': array, 'holiday': array}}
+        dynamic_patterns: 动态生成的模板 dict{col: {1: array, 0: array}}
 
     返回:
         预测结果DataFrame，包含 'time' 和各索引列的预测值
@@ -906,7 +908,8 @@ def predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stat
     # 检测索引列
     index_cols = detect_index_columns(df)
 
-    print(f"\n开始预测当天剩余时间（基于{day_type}模式，{interval_minutes}分钟间隔）...")
+    day_type_name = {1: '工作日', 0: '假期', 'anomaly': '异常'}.get(day_type, str(day_type))
+    print(f"\n开始预测当天剩余时间（基于{day_type_name}模式，{interval_minutes}分钟间隔）...")
     print(f"索引列: {index_cols}")
 
     # 处理0点预测情况（first_9_hours为空）
@@ -957,9 +960,9 @@ def predict_remaining_day(df, first_9_hours, day_type, day_data, historical_stat
     # 将数值day_type转换为字符串类型
     if isinstance(day_type, (int, float)):
         if day_type == 1:
-            day_type_str = 'weekday'
+            day_type_str = 1
         elif day_type == 0:
-            day_type_str = 'holiday'
+            day_type_str = 0
         else:
             day_type_str = 'anomaly'
         print(f"日期类型转换: {day_type} -> {day_type_str}")
@@ -1008,10 +1011,10 @@ def _predict_single_column(df, first_9_hours, day_type_str, last_value, historic
         for i in range(num_predictions):
             current_val += trend_per_point
             # 趋向历史均值
-            if historical_stats and 'weekday' in historical_stats:
-                historical_mean = historical_stats['weekday']['mean']
-            elif historical_stats and 'holiday' in historical_stats:
-                historical_mean = historical_stats['holiday']['mean']
+            if historical_stats and 1 in historical_stats:
+                historical_mean = historical_stats[1]['mean']
+            elif historical_stats and 0 in historical_stats:
+                historical_mean = historical_stats[0]['mean']
             else:
                 historical_mean = last_value
             decay_factor = 0.02
@@ -1025,10 +1028,10 @@ def _predict_single_column(df, first_9_hours, day_type_str, last_value, historic
         if pattern_dict is None:
             raise ValueError(f"需要为该列提供 dynamic_patterns 参数")
 
-        if day_type_str == 'weekday':
-            base_pattern = pattern_dict['weekday'].copy()
+        if day_type_str == 1:
+            base_pattern = pattern_dict[1].copy()
         else:
-            base_pattern = pattern_dict['holiday'].copy()
+            base_pattern = pattern_dict[0].copy()
 
         if len(first_9_hours) > 0:
             observed_mean = first_9_hours.values.mean()
@@ -1518,12 +1521,12 @@ def predict_daily_remaining(input_df, target_date=None, max_history_days=None,
                             if d.weekday() < 5 and d not in anomaly_dates])
         holiday_count = len([d for d in pd.to_datetime(stats_df['time']).dt.date.unique()
                             if d.weekday() >= 5 and d not in anomaly_dates])
-        if 'weekday' in historical_stats:
-            print(f"  工作日 - 均值: {historical_stats['weekday']['mean']:.1f}, "
-                  f"标准差: {historical_stats['weekday']['std']:.1f} (样本数: {weekday_count})")
-        if 'holiday' in historical_stats:
-            print(f"  假期   - 均值: {historical_stats['holiday']['mean']:.1f}, "
-                  f"标准差: {historical_stats['holiday']['std']:.1f} (样本数: {holiday_count})")
+        if 1 in historical_stats:
+            print(f"  工作日 - 均值: {historical_stats[1]['mean']:.1f}, "
+                  f"标准差: {historical_stats[1]['std']:.1f} (样本数: {weekday_count})")
+        if 0 in historical_stats:
+            print(f"  假期   - 均值: {historical_stats[0]['mean']:.1f}, "
+                  f"标准差: {historical_stats[0]['std']:.1f} (样本数: {holiday_count})")
 
     # 步骤3: 数据预处理（自动截取最近max_history_days天，用于实际训练/预测）
     df = load_and_preprocess_data(processed_df, max_history_days=max_history_days, interval_minutes=interval_minutes)
@@ -1604,9 +1607,9 @@ def predict_at_midnight(input_df, interval_minutes=15, calendar_day_type_input=0
 
     # 参数转换: 1=工作日, 0=休息日
     if calendar_day_type_input == 1:
-        day_type = 'weekday'
+        day_type = 1
     elif calendar_day_type_input == 0:
-        day_type = 'holiday'
+        day_type = 0
     else:
         day_type = 'anomaly'
 
@@ -1742,7 +1745,7 @@ def predict_at_nine(input_df, first_9_hours_df, interval_minutes=15, max_history
                                 is_anomaly=is_target_anomaly, mode='predict',
                                 dynamic_patterns=dynamic_patterns, history_df=df)
 
-    day_type_display = {'weekday': '工作日', 'holiday': '节假日', 'anomaly': '异常日期'}
+    day_type_display = {1: '工作日', 0: '节假日', 'anomaly': '异常日期'}
     print(f"推断的日期类型: {day_type} ({day_type_display.get(day_type, day_type)})")
 
     # 获取当天已有数据（0-9点）
@@ -1775,7 +1778,7 @@ def predict_at_nine(input_df, first_9_hours_df, interval_minutes=15, max_history
 
     # 将字符串日期类型转换为数值类型返回
     # weekday=0, holiday=1, anomaly=2
-    day_type_numeric = 1 if day_type == 'weekday' else (0 if day_type == 'holiday' else 2)
+    day_type_numeric = 1 if day_type == 1 else (0 if day_type == 0 else 2)
 
     return day_type_numeric, forecast_df
 
@@ -1892,7 +1895,7 @@ def evaluate_day_type_by_comparison(forecast_df, actual_df):
         actual_df: 当日实际数据DataFrame，包含 'time' 和 'value' 列
 
     返回:
-        日期类型: 'weekday' / 'holiday' / 'anomaly'
+        日期类型: 1 / 0 / 'anomaly'
     """
     print("=" * 60)
     print("日期类型评估 - 通过预测与实际对比")
@@ -1934,7 +1937,7 @@ def evaluate_day_type_by_comparison(forecast_df, actual_df):
     evaluated_day_type = evaluate_day_type(actual_df.reset_index(), historical_stats=None,
                                             anomaly_dates=None, interval_minutes=15)
 
-    day_type_display = {'weekday': '工作日', 'holiday': '节假日', 'anomaly': '异常日期'}
+    day_type_display = {1: '工作日', 0: '节假日', 'anomaly': '异常日期'}
     print(f"评估结果: {evaluated_day_type} ({day_type_display.get(evaluated_day_type, evaluated_day_type)})")
 
     return evaluated_day_type
@@ -1969,10 +1972,10 @@ def preprocess_for_prediction(input_df, interval_minutes=15, max_history_days=No
 
     if historical_stats:
         print(f"\n历史统计 (基于{stats_window_days}天数据):")
-        if 'weekday' in historical_stats:
-            print(f"  工作日 - 均值: {historical_stats['weekday']['mean']:.1f}, 标准差: {historical_stats['weekday']['std']:.1f}")
-        if 'holiday' in historical_stats:
-            print(f"  假期 - 均值: {historical_stats['holiday']['mean']:.1f}, 标准差: {historical_stats['holiday']['std']:.1f}")
+        if 1 in historical_stats:
+            print(f"  工作日 - 均值: {historical_stats[1]['mean']:.1f}, 标准差: {historical_stats[1]['std']:.1f}")
+        if 0 in historical_stats:
+            print(f"  假期 - 均值: {historical_stats[0]['mean']:.1f}, 标准差: {historical_stats[0]['std']:.1f}")
 
     return {
         'df': df,
@@ -1996,10 +1999,10 @@ def evaluate_day_type(full_day_data, historical_stats=None, anomaly_dates=None, 
         historical_stats: 历史统计数据
         anomaly_dates: 已检测到的异常日期集合
         interval_minutes: 时间间隔分钟数（15或60）
-        dynamic_patterns: 动态生成的模板 dict{'weekday': array, 'holiday': array}
+        dynamic_patterns: 动态生成的模板 dict{1: array, 0: array}
 
     返回:
-        'weekday', 'holiday' 或 'anomaly'
+        1, 0 或 'anomaly'
     """
     if len(full_day_data) == 0:
         raise ValueError("当天没有数据")
@@ -2054,8 +2057,8 @@ def evaluate_day_type(full_day_data, historical_stats=None, anomaly_dates=None, 
     if dynamic_patterns is None or not isinstance(dynamic_patterns, dict):
         raise ValueError("evaluate_day_type requires dynamic_patterns parameter from generate_pattern_from_history()")
 
-    weekday_pattern = dynamic_patterns.get('weekday')
-    holiday_pattern = dynamic_patterns.get('holiday')
+    weekday_pattern = dynamic_patterns.get(1)
+    holiday_pattern = dynamic_patterns.get(0)
 
     weekday_similarity = calculate_pattern_similarity(full_values, weekday_pattern)
     holiday_similarity = calculate_pattern_similarity(full_values, holiday_pattern)
@@ -2073,15 +2076,15 @@ def evaluate_day_type(full_day_data, historical_stats=None, anomaly_dates=None, 
 
     # 2. 偏离历史统计
     if historical_stats:
-        if 'weekday' in historical_stats:
-            wd_mean = historical_stats['weekday']['mean']
-            wd_std = historical_stats['weekday']['std']
+        if 1 in historical_stats:
+            wd_mean = historical_stats[1]['mean']
+            wd_std = historical_stats[1]['std']
             if abs(mean_value - wd_mean) > 3 * wd_std:
                 anomaly_reasons.append(f"均值偏离工作日({abs(mean_value - wd_mean):.1f} > 3σ)")
 
-        if 'holiday' in historical_stats:
-            hl_mean = historical_stats['holiday']['mean']
-            hl_std = historical_stats['holiday']['std']
+        if 0 in historical_stats:
+            hl_mean = historical_stats[0]['mean']
+            hl_std = historical_stats[0]['std']
             if abs(mean_value - hl_mean) > 3 * hl_std:
                 anomaly_reasons.append(f"均值偏离假期({abs(mean_value - hl_mean):.1f} > 3σ)")
 
@@ -2105,10 +2108,10 @@ def evaluate_day_type(full_day_data, historical_stats=None, anomaly_dates=None, 
     # 非异常日期，判断为工作日或假期
     if weekday_similarity >= holiday_similarity:
         print(f"\n评估结果: WEEKDAY")
-        return 'weekday'
+        return 1
     else:
         print(f"\n评估结果: HOLIDAY")
-        return 'holiday'
+        return 0
 
 
 def batch_evaluate_days(df, historical_stats=None, anomaly_dates=None, interval_minutes=15):
@@ -2142,7 +2145,7 @@ def generate_sample_data(days=800, pattern_type='mixed', interval_minutes=15, nu
 
     参数:
         days: 生成天数（默认800天≈2.2年）
-        pattern_type: 'weekday', 'weekend', 'mixed'
+        pattern_type: 1, 'weekend', 'mixed'
         interval_minutes: 时间间隔分钟数（5、15或60）
         num_indices: 索引列数量（默认1，支持多列）
     """
